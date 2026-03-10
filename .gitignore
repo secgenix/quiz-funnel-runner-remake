@@ -1,0 +1,7 @@
+﻿venv/
+results/
+__pycache__/
+*.png
+*.html
+dump*.html
+.idea

@@ -1,0 +1,22 @@
+{
+ "funnels": [
+  "https://coursiv.io/dynamic?prc_id=1069",
+  "https://coursiv.io/dynamic",
+  "https://dance-bit.com/welcomeBellyRef",
+  "https://madmuscles.com/funnel/default-uni-soft-new/step-one",
+  "https://quiz.fitme.expert/intro-111"
+ ],
+ "max_funnels": 5,
+ "max_steps": 80,
+ "slow_mo_ms": 50,
+ "fill_values": {
+  "name": "John",
+  "email": "testuser{ts}@gmail.com",
+  "age": "30",
+  "height": "170",
+  "weight": "70",
+  "goal_weight": "60",
+  "default_number": "25",
+  "date_of_birth": "01/01/1990"
+ }
+}
