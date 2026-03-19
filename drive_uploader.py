@@ -1,33 +1,39 @@
 """
 Google Drive интеграция для Quiz Funnel Runner
-Загрузка скриншотов и результатов в Google Drive
+Загрузка скриншотов и результатов в Google Drive через OAuth 2.0
 """
 import os
 import io
 import logging
+import pickle
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
 
-# Разрешения для Service Account
+# Разрешения для OAuth 2.0
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
+
+# Файлы для хранения токена
+TOKEN_FILE = "token.pickle"
 
 
 class GoogleDriveUploader:
-    """Класс для загрузки файлов в Google Drive"""
+    """Класс для загрузки файлов в Google Drive через OAuth 2.0"""
 
     def __init__(self, credentials_file: str, folder_id: str = ""):
         """
         Инициализация загрузчика
         
         Args:
-            credentials_file: Путь к JSON файлу с учетными данными service account
+            credentials_file: Путь к JSON файлу с учетными данными OAuth (client_secret.json)
             folder_id: ID корневой папки в Google Drive (опционально)
         """
         self.credentials_file = credentials_file
@@ -36,18 +42,48 @@ class GoogleDriveUploader:
         self._initialize_service()
 
     def _initialize_service(self) -> None:
-        """Инициализация сервиса Google Drive API"""
+        """Инициализация сервиса Google Drive API через OAuth 2.0"""
         try:
-            if not os.path.exists(self.credentials_file):
-                logger.error(f"Файл учетных данных не найден: {self.credentials_file}")
-                return
+            creds = None
+            
+            # Проверяем сохраненный токен
+            if os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, 'rb') as token:
+                    creds = pickle.load(token)
 
-            credentials = service_account.Credentials.from_service_account_file(
-                self.credentials_file,
-                scopes=SCOPES
-            )
+            # Если токена нет или он невалиден, запускаем авторизацию
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    logger.info("Обновление токена...")
+                    creds.refresh(Request())
+                else:
+                    logger.info("Запуск авторизации OAuth 2.0...")
+                    
+                    if not os.path.exists(self.credentials_file):
+                        logger.error(f"Файл credentials не найден: {self.credentials_file}")
+                        logger.error("Скачайте client_secret.json из Google Cloud Console")
+                        return
+                    
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        self.credentials_file,
+                        SCOPES
+                    )
+                    
+                    # Запускаем локальный сервер для авторизации
+                    creds = flow.run_local_server(
+                        port=0,
+                        host='localhost',
+                        open_browser=True
+                    )
+                    
+                    logger.info("Авторизация успешна!")
+                
+                # Сохраняем токен
+                with open(TOKEN_FILE, 'wb') as token:
+                    pickle.dump(creds, token)
+                    logger.info(f"Токен сохранен в {TOKEN_FILE}")
 
-            self.service = build('drive', 'v3', credentials=credentials)
+            self.service = build('drive', 'v3', credentials=creds)
             logger.info("Google Drive сервис инициализирован")
 
         except Exception as e:
@@ -94,14 +130,14 @@ class GoogleDriveUploader:
             return None
 
     def upload_file(self, file_path: str, folder_id: str = "", 
-                    make_shareable: bool = True) -> Optional[str]:
+                    make_shareable: bool = False) -> Optional[str]:
         """
         Загрузка файла в Google Drive
         
         Args:
             file_path: Путь к файлу для загрузки
             folder_id: ID папки для загрузки (если пустой, используется folder_id из конфига)
-            make_shareable: Сделать файл доступным по ссылке
+            make_shareable: Сделать файл доступным по ссылке (для OAuth не требуется)
             
         Returns:
             Ссылка на файл или None
@@ -134,41 +170,13 @@ class GoogleDriveUploader:
             file_id = file.get('id')
             logger.info(f"Загружен файл: {os.path.basename(file_path)} (ID: {file_id})")
 
-            # Делаем файл доступным по ссылке
-            if make_shareable:
-                self._make_file_shareable(file_id)
-
+            # Для OAuth 2.0 файл уже доступен пользователю
             # Возвращаем ссылку
             return f"https://drive.google.com/file/d/{file_id}/view"
 
         except HttpError as error:
             logger.error(f"Ошибка загрузки файла: {error}")
             return None
-
-    def _make_file_shareable(self, file_id: str) -> None:
-        """
-        Сделать файл доступным по ссылке для всех
-        
-        Args:
-            file_id: ID файла в Google Drive
-        """
-        if not self.service:
-            return
-
-        try:
-            self.service.permissions().create(
-                fileId=file_id,
-                body={
-                    'type': 'anyone',
-                    'role': 'reader'
-                },
-                fields='id'
-            ).execute()
-
-            logger.info(f"Файл {file_id} сделан доступным по ссылке")
-
-        except HttpError as error:
-            logger.error(f"Ошибка предоставления доступа: {error}")
 
     def upload_funnel_results(self, slug: str, result_dir: str, 
                              drive_folder_id: str = "") -> Optional[str]:
@@ -310,6 +318,23 @@ class GoogleDriveUploader:
             logger.error(f"Ошибка получения списка файлов: {error}")
             return []
 
+    def revoke_token(self) -> bool:
+        """
+        Отозвать токен доступа (для сброса авторизации)
+        
+        Returns:
+            True если успешно
+        """
+        try:
+            if os.path.exists(TOKEN_FILE):
+                os.remove(TOKEN_FILE)
+                logger.info(f"Токен удален: {TOKEN_FILE}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка удаления токена: {e}")
+            return False
+
 
 def upload_to_drive(credentials_file: str, file_path: str, 
                    folder_name: str = "", parent_folder_id: str = "") -> Optional[str]:
@@ -317,7 +342,7 @@ def upload_to_drive(credentials_file: str, file_path: str,
     Удобная функция для быстрой загрузки файла в Google Drive
     
     Args:
-        credentials_file: Путь к файлу учетных данных
+        credentials_file: Путь к файлу учетных данных OAuth
         file_path: Путь к файлу для загрузки
         folder_name: Имя папки для создания (опционально)
         parent_folder_id: ID родительской папки

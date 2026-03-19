@@ -4,11 +4,14 @@
 import sqlite3
 import json
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class TaskStatus(str, Enum):
@@ -119,10 +122,24 @@ class TaskManager:
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS url_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                task_id INTEGER,
+                FOREIGN KEY (task_id) REFERENCES tasks(id)
+            )
+        """)
+
+        cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)
         """)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_url_queue_user_id ON url_queue(user_id)
         """)
 
         conn.commit()
@@ -305,7 +322,7 @@ class TaskManager:
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT COUNT(*) FROM tasks 
+            SELECT COUNT(*) FROM tasks
             WHERE status = ?
         """, (TaskStatus.PROCESSING.value,))
 
@@ -313,3 +330,110 @@ class TaskManager:
         conn.close()
 
         return count
+
+    # ====================
+    # Методы для очереди URL
+    # ====================
+
+    async def add_urls_to_queue(self, user_id: int, urls: List[str]) -> int:
+        """
+        Добавление списка URL в очередь
+        
+        Args:
+            user_id: ID пользователя
+            urls: Список URL
+            
+        Returns:
+            Количество добавленных URL
+        """
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            now = datetime.now().isoformat()
+            added_count = 0
+            
+            for url in urls:
+                try:
+                    cursor.execute("""
+                        INSERT INTO url_queue (user_id, url, created_at)
+                        VALUES (?, ?, ?)
+                    """, (user_id, url, now))
+                    added_count += 1
+                except Exception as e:
+                    logger.debug(f"Ошибка добавления URL в очередь: {e}")
+
+            conn.commit()
+            conn.close()
+
+            return added_count
+
+    async def get_queued_urls_count(self, user_id: int) -> int:
+        """Получение количества URL в очереди"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT COUNT(*) FROM url_queue
+            WHERE user_id = ?
+        """, (user_id,))
+
+        count = cursor.fetchone()[0]
+        conn.close()
+
+        return count
+
+    async def pop_queued_urls(self, user_id: int, limit: int) -> List[str]:
+        """
+        Получение и удаление URL из очереди
+        
+        Args:
+            user_id: ID пользователя
+            limit: Максимальное количество URL
+            
+        Returns:
+            Список URL
+        """
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            # Получаем URL
+            cursor.execute("""
+                SELECT id, url FROM url_queue
+                WHERE user_id = ?
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (user_id, limit))
+
+            rows = cursor.fetchall()
+            urls = [row[1] for row in rows]
+            ids = [row[0] for row in rows]
+
+            # Удаляем полученные URL
+            if ids:
+                placeholders = ','.join('?' * len(ids))
+                cursor.execute(f"""
+                    DELETE FROM url_queue
+                    WHERE id IN ({placeholders})
+                """, ids)
+
+            conn.commit()
+            conn.close()
+
+            return urls
+
+    async def get_all_users_with_queued_urls(self) -> List[int]:
+        """Получение списка всех пользователей с URL в очереди"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT DISTINCT user_id FROM url_queue
+        """)
+
+        rows = cursor.fetchall()
+        user_ids = [row[0] for row in rows]
+
+        conn.close()
+        return user_ids

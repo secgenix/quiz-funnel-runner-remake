@@ -7,4 +7,6 @@ dump*.html
 .idea
 .env
 credentials.json
+client_secret.json
+token.pickle
 *.db

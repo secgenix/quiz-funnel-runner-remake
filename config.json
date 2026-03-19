@@ -19,7 +19,7 @@
     }
   },
   "google_drive": {
-    "enabled": false,
+    "enabled": true,
     "credentials_file": "credentials.json",
     "folder_id": ""
   },

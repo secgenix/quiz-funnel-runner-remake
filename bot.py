@@ -24,6 +24,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import get_config, init_config
 from models import TaskManager, FunnelTask, TaskStatus
 from drive_uploader import GoogleDriveUploader
+from google_links_reader import GoogleLinksReader, is_google_url
 
 # Импортируем функции из main.py
 from main import (
@@ -80,15 +81,30 @@ class FormStates(StatesGroup):
 
 def is_valid_url(url: str) -> bool:
     """Проверка валидности URL"""
+    if not url or not isinstance(url, str):
+        return False
+    
+    # Быстрая проверка начала URL
+    url = url.strip()
+    if not (url.startswith('http://') or url.startswith('https://')):
+        return False
+    
+    # Более гибкий regex для URL с параметрами и спецсимволами
     pattern = re.compile(
-        r'^https?://'
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'
-        r'localhost|'
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-        r'(?::\d+)?'
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE
+        r'^https?://'  # http:// или https://
+        r'(?:[^\s<>\"{}|\\^`\[\]]+)',  # домен и путь
+        re.IGNORECASE
     )
-    return url is not None and pattern.match(url)
+    
+    # Проверяем наличие домена
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return False
+        return pattern.match(url) is not None
+    except Exception:
+        return False
 
 
 def check_user_access(user_id: int) -> bool:
@@ -325,6 +341,41 @@ async def cmd_cancel(message: Message) -> None:
         await message.answer("❌ Не удалось отменить задачу.")
 
 
+async def cmd_clear(message: Message) -> None:
+    """Обработка команды /clear - сброс зависших задач"""
+    user_id = message.from_user.id
+
+    if not check_user_access(user_id):
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
+        return
+
+    # Получаем все задачи пользователя в статусе processing
+    all_tasks = await task_manager.get_user_tasks(user_id, limit=100)
+    stuck_tasks = [t for t in all_tasks if t.status == TaskStatus.PROCESSING]
+    
+    if not stuck_tasks:
+        await message.answer("✅ Нет зависших задач.")
+        return
+    
+    # Сбрасываем статус на failed
+    cleared_count = 0
+    for task in stuck_tasks:
+        await task_manager.update_status(task.id, TaskStatus.FAILED)
+        await task_manager.complete_task(
+            task_id=task.id,
+            steps_total=0,
+            paywall_reached=False,
+            error="Task stuck, cleared by user"
+        )
+        cleared_count += 1
+    
+    await message.answer(
+        f"✅ <b>Очищено задач: {cleared_count}</b>\n\n"
+        f"Зависшие задачи сброшены. Можете запустить их заново.",
+        parse_mode="HTML"
+    )
+
+
 async def cmd_drive(message: Message) -> None:
     """Обработка команды /drive - получение ссылки на Google Drive"""
     user_id = message.from_user.id
@@ -366,11 +417,13 @@ async def cmd_help(message: Message) -> None:
         "/status - Статус последней задачи\n"
         "/history - История задач\n"
         "/cancel - Отмена текущей задачи\n"
+        "/clear - Сброс зависших задач\n"
         "/drive - Ссылка на Google Drive с результатами\n"
         "/help - Эта справка\n\n"
         "📝 <b>Также вы можете:</b>\n"
         "• Отправить URL воронки для обработки\n"
-        "• Отправить несколько URL (каждый с новой строки)",
+        "• Отправить несколько URL (каждый с новой строки)\n"
+        "• Отправить ссылку на Google Sheets/Docs для чтения URL",
         parse_mode="HTML"
     )
 
@@ -384,7 +437,7 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
 
     if not check_user_access(user_id):
-        await message.answer("❌ Доступ запрещен")
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
         return
 
     # Проверяем текущее состояние
@@ -394,8 +447,47 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
 
     text = message.text.strip()
 
-    # Проверяем, это список URL или один URL
-    urls = [u.strip() for u in text.split('\n') if u.strip()]
+    # Проверяем, это Google Sheet/Doc или список URL
+    urls = []
+    is_google_link = False
+    
+    # Проверяем каждый URL в сообщении
+    input_urls = [u.strip() for u in text.split('\n') if u.strip()]
+    
+    for url in input_urls:
+        if is_google_url(url):
+            is_google_link = True
+            # Читаем URL из Google Sheet/Doc
+            cfg = get_config()
+            reader = GoogleLinksReader(cfg.google_drive.credentials_file)
+            
+            await message.answer(
+                f"🔄 <b>Чтение URL из Google документа...</b>\n\n"
+                f"<code>{url[:60]}</code>",
+                parse_mode="HTML"
+            )
+            
+            # Определяем тип документа и читаем URL
+            if reader.is_google_sheet_url(url):
+                sheet_urls = reader.read_urls_from_sheet(url)
+                urls.extend(sheet_urls)
+                await message.answer(
+                    f"✅ <b>Прочитано {len(sheet_urls)} URL из Google Sheets</b>",
+                    parse_mode="HTML"
+                )
+            elif reader.is_google_doc_url(url):
+                doc_urls = reader.read_urls_from_doc(url)
+                urls.extend(doc_urls)
+                await message.answer(
+                    f"✅ <b>Прочитано {len(doc_urls)} URL из Google Docs</b>",
+                    parse_mode="HTML"
+                )
+        else:
+            urls.append(url)
+
+    # Если это не Google документ, используем исходные URL
+    if not is_google_link:
+        urls = input_urls
 
     # Валидация URL
     invalid_urls = []
@@ -412,26 +504,53 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
         )
         return
 
-    # Проверяем лимит очереди
-    user_tasks = await task_manager.get_user_tasks(user_id, limit=MAX_QUEUE_PER_USER + 1)
-    pending_count = sum(1 for t in user_tasks if t.status == TaskStatus.PENDING)
-    if pending_count >= MAX_QUEUE_PER_USER:
+    if not urls:
         await message.answer(
-            f"⚠️ <b>Лимит очереди</b>\n\n"
-            f"У вас уже {pending_count} задач в очереди. Максимум: {MAX_QUEUE_PER_USER}\n"
-            f"Дождитесь завершения или отмените задачи через /cancel",
+            "❌ <b>Не найдено URL для обработки</b>\n\n"
+            "Убедитесь, что документ содержит URL (начинаются с http:// или https://)",
             parse_mode="HTML"
         )
         return
 
-    # Создаем задачи
+    # Сохраняем все URL в очередь
+    total_urls = len(urls)
+    added_count = await task_manager.add_urls_to_queue(user_id, urls)
+    
+    # Создаем задачи только для доступных слотов
+    user_tasks = await task_manager.get_user_tasks(user_id, limit=MAX_QUEUE_PER_USER + 1)
+    pending_count = sum(1 for t in user_tasks if t.status == TaskStatus.PENDING)
+    active_count = await task_manager.get_active_task_count()
+    available_slots = MAX_CONCURRENT_TASKS - active_count
+    max_pending = MAX_QUEUE_PER_USER - pending_count
+    
+    # Создаем задачи в доступных слотах
+    urls_to_create = min(available_slots, max_pending, added_count)
+    
     created_tasks = []
-    for url in urls[:10]:  # Максимум 10 URL за раз
-        task = await task_manager.create_task(user_id, url)
-        created_tasks.append(task)
+    if urls_to_create > 0:
+        # Получаем URL из очереди
+        urls_to_process = await task_manager.pop_queued_urls(user_id, urls_to_create)
+        for url in urls_to_process:
+            task = await task_manager.create_task(user_id, url)
+            created_tasks.append(task)
 
     # Отправляем подтверждение
-    if len(created_tasks) == 1:
+    if total_urls > added_count:
+        await message.answer(
+            f"⚠️ <b>Обработано URL: {total_urls}</b>\n"
+            f"✅ <b>Добавлено в очередь: {added_count}</b>\n"
+            f"🔄 <b>Создано задач: {len(created_tasks)}</b>\n\n"
+            f"Остальные URL будут обработаны автоматически по мере освобождения слотов.",
+            parse_mode="HTML"
+        )
+    elif len(created_tasks) < total_urls:
+        await message.answer(
+            f"✅ <b>Создано задач: {len(created_tasks)}</b>\n\n"
+            + "\n".join(f"#{t.id} - <code>{t.url[:50]}</code>" for t in created_tasks) + "\n\n"
+            f"⏳ Остальные {total_urls - len(created_tasks)} URL добавлены в очередь и будут обработаны автоматически.",
+            parse_mode="HTML"
+        )
+    elif len(created_tasks) == 1:
         await message.answer(
             f"✅ <b>Задача создана</b>\n\n"
             f"<b>ID:</b> #{created_tasks[0].id}\n"
@@ -552,11 +671,41 @@ class TaskQueueProcessor:
         while self.is_running:
             try:
                 await self._process_pending_tasks()
+                await self._process_queued_urls()
             except Exception as e:
                 logger.error(f"Ошибка в процессоре очереди: {e}")
             
             # Пауза между проверками
             await asyncio.sleep(2)
+    
+    async def _process_queued_urls(self):
+        """Обработка URL из очереди"""
+        # Получаем активных задач
+        active_count = await task_manager.get_active_task_count()
+        available_slots = MAX_CONCURRENT_TASKS - active_count
+        
+        if available_slots <= 0:
+            return
+        
+        # Получаем всех пользователей с URL в очереди
+        user_ids = await task_manager.get_all_users_with_queued_urls()
+        
+        for user_id in user_ids:
+            # Проверяем сколько у пользователя pending задач
+            user_tasks = await task_manager.get_user_tasks(user_id, limit=MAX_QUEUE_PER_USER + 1)
+            pending_count = sum(1 for t in user_tasks if t.status == TaskStatus.PENDING)
+            
+            # Если есть свободные слоты
+            user_available = min(MAX_CONCURRENT_TASKS - active_count, MAX_QUEUE_PER_USER - pending_count)
+            if user_available > 0:
+                # Получаем URL из очереди
+                queued_urls = await task_manager.pop_queued_urls(user_id, user_available)
+                
+                if queued_urls:
+                    logger.info(f"Пользователь {user_id}: создано {len(queued_urls)} задач из очереди")
+                    # Создаем задачи
+                    for url in queued_urls:
+                        await task_manager.create_task(user_id, url)
     
     async def _process_pending_tasks(self):
         """Обработка ожидающих задач"""
@@ -831,6 +980,7 @@ async def start_bot() -> None:
     router.message.register(cmd_status, Command("status"))
     router.message.register(cmd_history, Command("history"))
     router.message.register(cmd_cancel, Command("cancel"))
+    router.message.register(cmd_clear, Command("clear"))
     router.message.register(cmd_drive, Command("drive"))
     router.message.register(cmd_help, Command("help"))
 
