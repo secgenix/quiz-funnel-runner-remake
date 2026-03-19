@@ -1,22 +1,42 @@
 {
- "funnels": [
-  "https://coursiv.io/dynamic?prc_id=1069",
-  "https://coursiv.io/dynamic",
-  "https://dance-bit.com/welcomeBellyRef",
-  "https://madmuscles.com/funnel/default-uni-soft-new/step-one",
-  "https://quiz.fitme.expert/intro-111"
- ],
- "max_funnels": 5,
- "max_steps": 80,
- "slow_mo_ms": 50,
- "fill_values": {
-  "name": "John",
-  "email": "testuser{ts}@gmail.com",
-  "age": "30",
-  "height": "170",
-  "weight": "70",
-  "goal_weight": "60",
-  "default_number": "25",
-  "date_of_birth": "01/01/1990"
- }
+  "bot": {
+    "use_only_admin": true
+  },
+  "runner": {
+    "max_steps": 80,
+    "max_funnels": 5,
+    "slow_mo_ms": 50,
+    "headless": true,
+    "fill_values": {
+      "name": "John",
+      "email": "testuser{ts}@gmail.com",
+      "age": "30",
+      "height": "170",
+      "weight": "70",
+      "goal_weight": "60",
+      "default_number": "25",
+      "date_of_birth": "01/01/1990"
+    }
+  },
+  "google_drive": {
+    "enabled": false,
+    "credentials_file": "credentials.json",
+    "folder_id": ""
+  },
+  "captcha": {
+    "enabled": false,
+    "service": "2captcha",
+    "api_key": ""
+  },
+  "funnels": [
+    "https://quiz.theliven.com/en/3508_0iu33/?utm_source=facebook&utm_campaign={{campaign.id}}&utm_adset={{adset.id}}&utm%E2%80%A6=&visitor_id=51e2b2f2-46e2-48f6-8b0d-87e6ae3ddd7f",
+    "https://myiq.com/ru/start?id=5808a8650adceaed7faf15dbf2c819476dc6e5545515d9736443d3fb0d25e39e&e=7faf15",
+    "https://madmuscles.com/funnel/default-uni-soft-new/step-one?utm_source=facebook&camp_id=%7B%7Bcampaign.id%7D%7D&c%E2%80%A6=&rr=0&brr=1",
+    "https://quiz.finelo.com/dynamic",
+    "https://pilates.harnafit.com/quiz-hd/step-start?rr=0&brr=1",
+    "https://iq.mental-impulse.com/flow/iq_test_1",
+    "https://quiz.dressly.world/en/shop-amazon-smart-plan-hp?utm_source=facebook&utm_term=%7B%7Badset.id%7D%7D&utm_content=&device_id=f455c503-9272-469c-b04c-bcd6e7564713",
+    "https://paw-champ.com/questionary/quiz/quiz27?utm_source={{site_source_name}}&utm_medium={{placement}}&utm_campaign={{ca%E2%80%A6"
+
+  ]
 }
