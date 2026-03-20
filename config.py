@@ -1,6 +1,7 @@
 """
 Конфигурация проекта Quiz Funnel Runner
 """
+
 import json
 import os
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ load_dotenv()
 @dataclass
 class BotConfig:
     """Конфигурация Telegram бота"""
+
     token: str = ""
     admin_ids: List[int] = field(default_factory=list)
     allowed_users: List[int] = field(default_factory=list)
@@ -23,25 +25,29 @@ class BotConfig:
 @dataclass
 class RunnerConfig:
     """Конфигурация раннера воронок"""
+
     max_steps: int = 80
     max_funnels: Optional[int] = None
     slow_mo_ms: int = 100
     headless: bool = True
-    fill_values: Dict[str, str] = field(default_factory=lambda: {
-        "name": "John",
-        "email": "testuser{ts}@gmail.com",
-        "age": "30",
-        "height": "170",
-        "weight": "70",
-        "goal_weight": "60",
-        "default_number": "25",
-        "date_of_birth": "01/01/1990",
-    })
+    fill_values: Dict[str, str] = field(
+        default_factory=lambda: {
+            "name": "John",
+            "email": "testuser{ts}@gmail.com",
+            "age": "30",
+            "height": "170",
+            "weight": "70",
+            "goal_weight": "60",
+            "default_number": "25",
+            "date_of_birth": "01/01/1990",
+        }
+    )
 
 
 @dataclass
 class GoogleDriveConfig:
     """Конфигурация Google Drive"""
+
     enabled: bool = False
     credentials_file: str = "credentials.json"
     folder_id: str = ""  # ID корневой папки для загрузки
@@ -50,18 +56,34 @@ class GoogleDriveConfig:
 @dataclass
 class CaptchaConfig:
     """Конфигурация CAPTCHA solving"""
+
     enabled: bool = False
     service: str = "2captcha"  # 2captcha, anticaptcha, capsolver
     api_key: str = ""
 
 
 @dataclass
+class AiFallbackConfig:
+    """Конфигурация AI fallback для прогресса на зависаниях."""
+
+    enabled: bool = False
+    model: str = "gpt-5.4-nano"
+    max_calls_per_stuck: int = 2
+    max_candidates: int = 16
+    text_char_limit: int = 16000
+    timeout_seconds: float = 30.0
+    max_concurrent_requests: int = 2
+
+
+@dataclass
 class Config:
     """Основная конфигурация"""
+
     bot: BotConfig = field(default_factory=BotConfig)
     runner: RunnerConfig = field(default_factory=RunnerConfig)
     google_drive: GoogleDriveConfig = field(default_factory=GoogleDriveConfig)
     captcha: CaptchaConfig = field(default_factory=CaptchaConfig)
+    ai_fallback: AiFallbackConfig = field(default_factory=AiFallbackConfig)
     funnels: List[str] = field(default_factory=list)
 
     @classmethod
@@ -77,12 +99,12 @@ class Config:
             data = json.load(f)
 
         bot_data = data.get("bot", {})
-        
+
         # Загружаем токен из переменных окружения (имеет приоритет)
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             token = bot_data.get("token", "")
-        
+
         # Загружаем admin_id из переменных окружения (имеет приоритет)
         admin_id = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
         admin_ids = bot_data.get("admin_ids", [])
@@ -95,12 +117,15 @@ class Config:
         runner_data = data.get("runner", {})
         drive_data = data.get("google_drive", {})
         captcha_data = data.get("captcha", {})
-        
+        ai_data = data.get("ai_fallback", {})
+
         # Загружаем Google Drive настройки из .env (имеют приоритет)
         drive_credentials_file = os.getenv("GOOGLE_DRIVE_CREDENTIALS_FILE", "").strip()
         if not drive_credentials_file:
-            drive_credentials_file = drive_data.get("credentials_file", "credentials.json")
-        
+            drive_credentials_file = drive_data.get(
+                "credentials_file", "credentials.json"
+            )
+
         drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
         if not drive_folder_id:
             drive_folder_id = drive_data.get("folder_id", "")
@@ -117,16 +142,19 @@ class Config:
                 max_funnels=runner_data.get("max_funnels"),
                 slow_mo_ms=runner_data.get("slow_mo_ms", 100),
                 headless=runner_data.get("headless", True),
-                fill_values=runner_data.get("fill_values", {
-                    "name": "John",
-                    "email": "testuser{ts}@gmail.com",
-                    "age": "30",
-                    "height": "170",
-                    "weight": "70",
-                    "goal_weight": "60",
-                    "default_number": "25",
-                    "date_of_birth": "01/01/1990",
-                }),
+                fill_values=runner_data.get(
+                    "fill_values",
+                    {
+                        "name": "John",
+                        "email": "testuser{ts}@gmail.com",
+                        "age": "30",
+                        "height": "170",
+                        "weight": "70",
+                        "goal_weight": "60",
+                        "default_number": "25",
+                        "date_of_birth": "01/01/1990",
+                    },
+                ),
             ),
             google_drive=GoogleDriveConfig(
                 enabled=drive_data.get("enabled", False),
@@ -137,6 +165,15 @@ class Config:
                 enabled=captcha_data.get("enabled", False),
                 service=captcha_data.get("service", "2captcha"),
                 api_key=captcha_data.get("api_key", ""),
+            ),
+            ai_fallback=AiFallbackConfig(
+                enabled=ai_data.get("enabled", False),
+                model=ai_data.get("model", "gpt-5.4-nano"),
+                max_calls_per_stuck=ai_data.get("max_calls_per_stuck", 2),
+                max_candidates=ai_data.get("max_candidates", 16),
+                text_char_limit=ai_data.get("text_char_limit", 16000),
+                timeout_seconds=ai_data.get("timeout_seconds", 30.0),
+                max_concurrent_requests=ai_data.get("max_concurrent_requests", 2),
             ),
             funnels=data.get("funnels", []),
         )
@@ -166,6 +203,15 @@ class Config:
                 "enabled": self.captcha.enabled,
                 "service": self.captcha.service,
                 "api_key": self.captcha.api_key,
+            },
+            "ai_fallback": {
+                "enabled": self.ai_fallback.enabled,
+                "model": self.ai_fallback.model,
+                "max_calls_per_stuck": self.ai_fallback.max_calls_per_stuck,
+                "max_candidates": self.ai_fallback.max_candidates,
+                "text_char_limit": self.ai_fallback.text_char_limit,
+                "timeout_seconds": self.ai_fallback.timeout_seconds,
+                "max_concurrent_requests": self.ai_fallback.max_concurrent_requests,
             },
             "funnels": self.funnels,
         }

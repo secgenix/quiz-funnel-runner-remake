@@ -28,6 +28,15 @@
     "service": "2captcha",
     "api_key": ""
   },
+  "ai_fallback": {
+    "enabled": true,
+    "model": "gpt-5.4-nano",
+    "max_calls_per_stuck": 2,
+    "max_candidates": 16,
+    "text_char_limit": 16000,
+    "timeout_seconds": 30.0,
+    "max_concurrent_requests": 2
+  },
   "funnels": [
     "https://quiz.theliven.com/en/3508_0iu33/?utm_source=facebook&utm_campaign={{campaign.id}}&utm_adset={{adset.id}}&utm%E2%80%A6=&visitor_id=51e2b2f2-46e2-48f6-8b0d-87e6ae3ddd7f",
     "https://myiq.com/ru/start?id=5808a8650adceaed7faf15dbf2c819476dc6e5545515d9736443d3fb0d25e39e&e=7faf15",

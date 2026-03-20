@@ -2,6 +2,7 @@
 Telegram бот для Quiz Funnel Runner
 Интеграция с aiogram 3.x
 """
+
 import asyncio
 import logging
 import os
@@ -25,6 +26,8 @@ from config import get_config, init_config
 from models import TaskManager, FunnelTask, TaskStatus
 from drive_uploader import GoogleDriveUploader
 from google_links_reader import GoogleLinksReader, is_google_url
+
+from ai_fallback import try_ai_resolve_stuck
 
 # Импортируем функции из main.py
 from main import (
@@ -58,8 +61,7 @@ import argparse
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -71,11 +73,12 @@ thread_pool: Optional[ThreadPoolExecutor] = None
 
 # Ограничения
 MAX_CONCURRENT_TASKS = 3  # Максимум одновременных задач
-MAX_QUEUE_PER_USER = 5    # Максимум задач в очереди на пользователя
+MAX_QUEUE_PER_USER = 5  # Максимум задач в очереди на пользователя
 
 
 class FormStates(StatesGroup):
     """Состояния FSM"""
+
     waiting_for_url = State()
 
 
@@ -83,22 +86,23 @@ def is_valid_url(url: str) -> bool:
     """Проверка валидности URL"""
     if not url or not isinstance(url, str):
         return False
-    
+
     # Быстрая проверка начала URL
     url = url.strip()
-    if not (url.startswith('http://') or url.startswith('https://')):
+    if not (url.startswith("http://") or url.startswith("https://")):
         return False
-    
+
     # Более гибкий regex для URL с параметрами и спецсимволами
     pattern = re.compile(
-        r'^https?://'  # http:// или https://
-        r'(?:[^\s<>\"{}|\\^`\[\]]+)',  # домен и путь
-        re.IGNORECASE
+        r"^https?://"  # http:// или https://
+        r"(?:[^\s<>\"{}|\\^`\[\]]+)",  # домен и путь
+        re.IGNORECASE,
     )
-    
+
     # Проверяем наличие домена
     try:
         from urllib.parse import urlparse
+
         parsed = urlparse(url)
         if not parsed.netloc:
             return False
@@ -144,7 +148,7 @@ async def get_task_status_text(task: FunnelTask) -> str:
     if task.status == TaskStatus.COMPLETED:
         text += f"<b>Шагов пройдено:</b> {task.steps_total}\n"
         text += f"<b>Paywall:</b> {'✅ Достигнут' if task.paywall_reached else '❌ Не достигнут'}\n"
-        
+
         if task.drive_folder_url:
             text += f"<b>Google Drive:</b> <a href='{task.drive_folder_url}'>Открыть папку</a>\n"
 
@@ -167,7 +171,7 @@ async def notify_task_start(bot: Bot, user_id: int, task: FunnelTask) -> None:
             f"<b>URL:</b> <code>{task.url}</code>\n"
             f"<b>ID задачи:</b> <code>#{task.id}</code>\n\n"
             f"Ожидайте, я сообщу о прогрессе и результатах.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления о старте: {e}")
@@ -184,7 +188,7 @@ async def notify_task_progress(bot: Bot, user_id: int, task: FunnelTask) -> None
                 f"<b>ID задачи:</b> #{task.id}\n"
                 f"<b>Шаг:</b> {task.current_step}/{task.steps_total}\n"
                 f"{task.progress_message}",
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления о прогрессе: {e}")
@@ -218,7 +222,9 @@ async def notify_task_complete(bot: Bot, user_id: int, task: FunnelTask) -> None
         logger.error(f"Ошибка отправки уведомления о завершении: {e}")
 
 
-async def notify_task_error(bot: Bot, user_id: int, task: FunnelTask, error: str) -> None:
+async def notify_task_error(
+    bot: Bot, user_id: int, task: FunnelTask, error: str
+) -> None:
     """Уведомление об ошибке задачи"""
     try:
         await bot.send_message(
@@ -227,7 +233,7 @@ async def notify_task_error(bot: Bot, user_id: int, task: FunnelTask, error: str
             f"<b>ID задачи:</b> #{task.id}\n"
             f"<b>URL:</b> <code>{task.url}</code>\n"
             f"<b>Ошибка:</b> <code>{error[:200]}</code>",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления об ошибке: {e}")
@@ -236,6 +242,7 @@ async def notify_task_error(bot: Bot, user_id: int, task: FunnelTask, error: str
 # ====================
 # Обработчики команд
 # ====================
+
 
 async def cmd_start(message: Message, state: FSMContext) -> None:
     """Обработка команды /start"""
@@ -246,7 +253,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
             "❌ <b>Доступ запрещен</b>\n\n"
             "У вас нет прав для использования этого бота. "
             "Обратитесь к администратору.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
@@ -264,7 +271,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "2. Или используйте /status для проверки статуса\n"
         "3. Или /history для просмотра истории\n\n"
         "📝 <b>Отправьте URL для начала:</b>",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     await state.set_state(FormStates.waiting_for_url)
 
@@ -280,7 +287,9 @@ async def cmd_status(message: Message) -> None:
     # Получаем последнюю активную задачу
     tasks = await task_manager.get_user_tasks(user_id, limit=1)
     if not tasks:
-        await message.answer("📭 У вас пока нет задач.\n\nОтправьте URL воронки для начала.")
+        await message.answer(
+            "📭 У вас пока нет задач.\n\nОтправьте URL воронки для начала."
+        )
         return
 
     task = tasks[0]
@@ -352,11 +361,11 @@ async def cmd_clear(message: Message) -> None:
     # Получаем все задачи пользователя в статусе processing
     all_tasks = await task_manager.get_user_tasks(user_id, limit=100)
     stuck_tasks = [t for t in all_tasks if t.status == TaskStatus.PROCESSING]
-    
+
     if not stuck_tasks:
         await message.answer("✅ Нет зависших задач.")
         return
-    
+
     # Сбрасываем статус на failed
     cleared_count = 0
     for task in stuck_tasks:
@@ -365,14 +374,14 @@ async def cmd_clear(message: Message) -> None:
             task_id=task.id,
             steps_total=0,
             paywall_reached=False,
-            error="Task stuck, cleared by user"
+            error="Task stuck, cleared by user",
         )
         cleared_count += 1
-    
+
     await message.answer(
         f"✅ <b>Очищено задач: {cleared_count}</b>\n\n"
         f"Зависшие задачи сброшены. Можете запустить их заново.",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
@@ -399,7 +408,7 @@ async def cmd_drive(message: Message) -> None:
                 f"<b>Шагов:</b> {task.steps_total}\n"
                 f"<b>Paywall:</b> {'✅ Достигнут' if task.paywall_reached else '❌'}\n\n"
                 f"🔗 <a href='{task.drive_folder_url}'>Открыть папку в Google Drive</a>",
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
             return
 
@@ -424,13 +433,14 @@ async def cmd_help(message: Message) -> None:
         "• Отправить URL воронки для обработки\n"
         "• Отправить несколько URL (каждый с новой строки)\n"
         "• Отправить ссылку на Google Sheets/Docs для чтения URL",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
 # ====================
 # Обработчики сообщений
 # ====================
+
 
 async def handle_url_message(message: Message, state: FSMContext) -> None:
     """Обработка URL от пользователя"""
@@ -450,37 +460,37 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
     # Проверяем, это Google Sheet/Doc или список URL
     urls = []
     is_google_link = False
-    
+
     # Проверяем каждый URL в сообщении
-    input_urls = [u.strip() for u in text.split('\n') if u.strip()]
-    
+    input_urls = [u.strip() for u in text.split("\n") if u.strip()]
+
     for url in input_urls:
         if is_google_url(url):
             is_google_link = True
             # Читаем URL из Google Sheet/Doc
             cfg = get_config()
             reader = GoogleLinksReader(cfg.google_drive.credentials_file)
-            
+
             await message.answer(
                 f"🔄 <b>Чтение URL из Google документа...</b>\n\n"
                 f"<code>{url[:60]}</code>",
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
-            
+
             # Определяем тип документа и читаем URL
             if reader.is_google_sheet_url(url):
                 sheet_urls = reader.read_urls_from_sheet(url)
                 urls.extend(sheet_urls)
                 await message.answer(
                     f"✅ <b>Прочитано {len(sheet_urls)} URL из Google Sheets</b>",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
                 )
             elif reader.is_google_doc_url(url):
                 doc_urls = reader.read_urls_from_doc(url)
                 urls.extend(doc_urls)
                 await message.answer(
                     f"✅ <b>Прочитано {len(doc_urls)} URL из Google Docs</b>",
-                    parse_mode="HTML"
+                    parse_mode="HTML",
                 )
         else:
             urls.append(url)
@@ -500,7 +510,7 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
             f"❌ <b>Некорректные URL:</b>\n"
             + "\n".join(f"<code>{u}</code>" for u in invalid_urls[:5])
             + "\n\nПожалуйста, проверьте формат URL.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
@@ -508,24 +518,26 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
         await message.answer(
             "❌ <b>Не найдено URL для обработки</b>\n\n"
             "Убедитесь, что документ содержит URL (начинаются с http:// или https://)",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
         return
 
     # Сохраняем все URL в очередь
     total_urls = len(urls)
     added_count = await task_manager.add_urls_to_queue(user_id, urls)
-    
+
     # Создаем задачи только для доступных слотов
-    user_tasks = await task_manager.get_user_tasks(user_id, limit=MAX_QUEUE_PER_USER + 1)
+    user_tasks = await task_manager.get_user_tasks(
+        user_id, limit=MAX_QUEUE_PER_USER + 1
+    )
     pending_count = sum(1 for t in user_tasks if t.status == TaskStatus.PENDING)
     active_count = await task_manager.get_active_task_count()
     available_slots = MAX_CONCURRENT_TASKS - active_count
     max_pending = MAX_QUEUE_PER_USER - pending_count
-    
+
     # Создаем задачи в доступных слотах
     urls_to_create = min(available_slots, max_pending, added_count)
-    
+
     created_tasks = []
     if urls_to_create > 0:
         # Получаем URL из очереди
@@ -541,14 +553,15 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
             f"✅ <b>Добавлено в очередь: {added_count}</b>\n"
             f"🔄 <b>Создано задач: {len(created_tasks)}</b>\n\n"
             f"Остальные URL будут обработаны автоматически по мере освобождения слотов.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     elif len(created_tasks) < total_urls:
         await message.answer(
             f"✅ <b>Создано задач: {len(created_tasks)}</b>\n\n"
-            + "\n".join(f"#{t.id} - <code>{t.url[:50]}</code>" for t in created_tasks) + "\n\n"
+            + "\n".join(f"#{t.id} - <code>{t.url[:50]}</code>" for t in created_tasks)
+            + "\n\n"
             f"⏳ Остальные {total_urls - len(created_tasks)} URL добавлены в очередь и будут обработаны автоматически.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     elif len(created_tasks) == 1:
         await message.answer(
@@ -556,13 +569,13 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
             f"<b>ID:</b> #{created_tasks[0].id}\n"
             f"<b>URL:</b> <code>{created_tasks[0].url}</code>\n\n"
             f"Используйте /status для проверки прогресса.",
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
     else:
         await message.answer(
             f"✅ <b>Создано задач: {len(created_tasks)}</b>\n\n"
             + "\n".join(f"#{t.id} - <code>{t.url[:50]}</code>" for t in created_tasks),
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
 
     # Запускаем процессор очереди (если еще не запущен)
@@ -592,17 +605,19 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
 # Google Drive загрузка
 # ====================
 
-async def upload_to_google_drive(slug: str, result_dir: str, 
-                                 credentials_file: str, folder_id: str) -> Optional[str]:
+
+async def upload_to_google_drive(
+    slug: str, result_dir: str, credentials_file: str, folder_id: str
+) -> Optional[str]:
     """
     Загрузка результатов воронки в Google Drive
-    
+
     Args:
         slug: Уникальный идентификатор воронки
         result_dir: Локальная директория с результатами
         credentials_file: Путь к файлу учетных данных
         folder_id: ID папки в Google Drive
-        
+
     Returns:
         Ссылка на папку в Google Drive или None
     """
@@ -611,25 +626,25 @@ async def upload_to_google_drive(slug: str, result_dir: str,
         if not os.path.exists(credentials_file):
             logger.error(f"Файл учетных данных не найден: {credentials_file}")
             return None
-        
+
         # Создаем загрузчик
         uploader = GoogleDriveUploader(credentials_file, folder_id)
-        
+
         if not uploader.service:
             logger.error("Не удалось инициализировать Google Drive сервис")
             return None
-        
+
         # Загружаем результаты
         logger.info(f"Загрузка результатов воронки {slug} в Google Drive...")
         drive_url = uploader.upload_funnel_results(slug, result_dir)
-        
+
         if drive_url:
             logger.info(f"Результаты загружены в Google Drive: {drive_url}")
         else:
             logger.warning("Не удалось загрузить результаты в Google Drive")
-        
+
         return drive_url
-        
+
     except Exception as e:
         logger.error(f"Ошибка загрузки в Google Drive: {e}")
         return None
@@ -639,22 +654,23 @@ async def upload_to_google_drive(slug: str, result_dir: str,
 # Очередь задач
 # ====================
 
+
 class TaskQueueProcessor:
     """Фоновый процессор очереди задач"""
-    
+
     def __init__(self):
         self.is_running = False
         self.task = None
-    
+
     async def start(self):
         """Запуск процессора очереди"""
         if self.is_running:
             return
-        
+
         self.is_running = True
         self.task = asyncio.create_task(self._process_queue_loop())
         logger.info("🔄 Процессор очереди запущен")
-    
+
     async def stop(self):
         """Остановка процессора очереди"""
         self.is_running = False
@@ -665,7 +681,7 @@ class TaskQueueProcessor:
             except asyncio.CancelledError:
                 pass
         logger.info("🛑 Процессор очереди остановлен")
-    
+
     async def _process_queue_loop(self):
         """Основной цикл обработки очереди"""
         while self.is_running:
@@ -674,74 +690,82 @@ class TaskQueueProcessor:
                 await self._process_queued_urls()
             except Exception as e:
                 logger.error(f"Ошибка в процессоре очереди: {e}")
-            
+
             # Пауза между проверками
             await asyncio.sleep(2)
-    
+
     async def _process_queued_urls(self):
         """Обработка URL из очереди"""
         # Получаем активных задач
         active_count = await task_manager.get_active_task_count()
         available_slots = MAX_CONCURRENT_TASKS - active_count
-        
+
         if available_slots <= 0:
             return
-        
+
         # Получаем всех пользователей с URL в очереди
         user_ids = await task_manager.get_all_users_with_queued_urls()
-        
+
         for user_id in user_ids:
             # Проверяем сколько у пользователя pending задач
-            user_tasks = await task_manager.get_user_tasks(user_id, limit=MAX_QUEUE_PER_USER + 1)
+            user_tasks = await task_manager.get_user_tasks(
+                user_id, limit=MAX_QUEUE_PER_USER + 1
+            )
             pending_count = sum(1 for t in user_tasks if t.status == TaskStatus.PENDING)
-            
+
             # Если есть свободные слоты
-            user_available = min(MAX_CONCURRENT_TASKS - active_count, MAX_QUEUE_PER_USER - pending_count)
+            user_available = min(
+                MAX_CONCURRENT_TASKS - active_count, MAX_QUEUE_PER_USER - pending_count
+            )
             if user_available > 0:
                 # Получаем URL из очереди
-                queued_urls = await task_manager.pop_queued_urls(user_id, user_available)
-                
+                queued_urls = await task_manager.pop_queued_urls(
+                    user_id, user_available
+                )
+
                 if queued_urls:
-                    logger.info(f"Пользователь {user_id}: создано {len(queued_urls)} задач из очереди")
+                    logger.info(
+                        f"Пользователь {user_id}: создано {len(queued_urls)} задач из очереди"
+                    )
                     # Создаем задачи
                     for url in queued_urls:
                         await task_manager.create_task(user_id, url)
-    
+
     async def _process_pending_tasks(self):
         """Обработка ожидающих задач"""
         # Получаем все pending задачи
         pending_tasks = await task_manager.get_pending_tasks()
-        
+
         if not pending_tasks:
             return
-        
+
         # Проверяем количество активных задач
         active_count = await task_manager.get_active_task_count()
         available_slots = MAX_CONCURRENT_TASKS - active_count
-        
+
         if available_slots <= 0:
             return
-        
+
         # Запускаем задачи в доступных слотах
         tasks_to_run = pending_tasks[:available_slots]
-        
+
         for task in tasks_to_run:
             # Проверяем, не начала ли задача уже выполняться
             current_task = await task_manager.get_task(task.id)
             if current_task and current_task.status == TaskStatus.PENDING:
                 asyncio.create_task(self._execute_task(task))
-    
+
     async def _execute_task(self, task: FunnelTask) -> None:
         """Выполнение одной задачи"""
         global thread_pool
-        
+
         # Обновляем статус на processing
         await task_manager.update_status(task.id, TaskStatus.PROCESSING)
-        
+
         # Уведомляем пользователя
         cfg = get_config()
         await notify_task_start(bot, task.user_id, task)
-        
+
         try:
             # Запускаем воронку в thread pool
             result = await asyncio.get_event_loop().run_in_executor(
@@ -753,7 +777,7 @@ class TaskQueueProcessor:
                 task.user_id,
                 None,
             )
-            
+
             # Загружаем в Google Drive если включено
             drive_url = None
             if cfg.google_drive.enabled and not result.get("error"):
@@ -766,7 +790,7 @@ class TaskQueueProcessor:
                     )
                 except Exception as e:
                     logger.error(f"Ошибка загрузки в Google Drive: {e}")
-            
+
             # Обновляем результаты
             await task_manager.complete_task(
                 task_id=task.id,
@@ -778,16 +802,18 @@ class TaskQueueProcessor:
                 manifest_path=result.get("manifest_path"),
                 drive_folder_url=drive_url,
             )
-            
+
             # Получаем обновленную задачу
             completed_task = await task_manager.get_task(task.id)
-            
+
             # Уведомляем о завершении
             if result.get("error"):
-                await notify_task_error(bot, task.user_id, completed_task, result["error"])
+                await notify_task_error(
+                    bot, task.user_id, completed_task, result["error"]
+                )
             else:
                 await notify_task_complete(bot, task.user_id, completed_task)
-                
+
         except Exception as e:
             logger.error(f"Ошибка обработки задачи #{task.id}: {e}")
             await task_manager.update_status(task.id, TaskStatus.FAILED)
@@ -799,8 +825,9 @@ class TaskQueueProcessor:
 queue_processor = TaskQueueProcessor()
 
 
-def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: int, 
-                            progress_callback=None) -> dict:
+def run_funnel_sync_wrapper(
+    url: str, config_dict: dict, task_id: int, user_id: int, progress_callback=None
+) -> dict:
     """
     Обертка для run_funnel с поддержкой прогресса
     progress_callback - синхронная функция для обновления прогресса
@@ -813,11 +840,11 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
     }
 
     slug = get_slug(url)
-    res_dir = os.path.join('results', slug)
+    res_dir = os.path.join("results", slug)
     os.makedirs(res_dir, exist_ok=True)
 
-    classified_dir = os.path.join('results', '_classified')
-    for cat in ['question', 'info', 'input', 'email', 'paywall', 'other', 'checkout']:
+    classified_dir = os.path.join("results", "_classified")
+    for cat in ["question", "info", "input", "email", "paywall", "other", "checkout"]:
         os.makedirs(os.path.join(classified_dir, cat), exist_ok=True)
 
     result = {
@@ -837,10 +864,13 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
     slow_mo = temp_config.get("slow_mo_ms", 100)
     fill_values = resolve_fill_values(temp_config)
 
-    log_path = os.path.join(res_dir, 'log.txt')
+    ai_cfg = get_config().ai_fallback
+
+    log_path = os.path.join(res_dir, "log.txt")
     result["log_path"] = log_path
 
-    with open(log_path, 'w', encoding='utf-8') as f:
+    with open(log_path, "w", encoding="utf-8") as f:
+
         def log(m):
             l = f"[{time.strftime('%H:%M:%S')}] {m}\n"
             f.write(l)
@@ -849,11 +879,11 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True, slow_mo=slow_mo)
-                page = browser.new_context(**p.devices['iPhone 13']).new_page()
+                page = browser.new_context(**p.devices["iPhone 13"]).new_page()
                 log(f"Переход на {url} (slug: {slug})")
 
                 try:
-                    page.goto(url, wait_until='load', timeout=60000)
+                    page.goto(url, wait_until="load", timeout=60000)
                 except TimeoutError:
                     result["error"] = "navigation_timeout"
                     log("Ошибка: таймаут открытия страницы")
@@ -867,10 +897,15 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                 while step <= max_steps:
                     # Обновляем прогресс через callback
                     if progress_callback:
-                        progress_callback(task_id, step, max_steps, f"Обработка шага {step}...")
+                        progress_callback(
+                            task_id, step, max_steps, f"Обработка шага {step}..."
+                        )
 
                     curr_u = page.url
-                    if any(k in curr_u for k in ["magic", "analyzing", "loading", "preparePlan"]):
+                    if any(
+                        k in curr_u
+                        for k in ["magic", "analyzing", "loading", "preparePlan"]
+                    ):
                         time.sleep(10)
                         curr_u = page.url
 
@@ -880,7 +915,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                     st = classify_screen(page, log)
                     ui_before = get_ui_step(page)
 
-                    if st in ['paywall', 'checkout']:
+                    if st in ["paywall", "checkout"]:
                         warmup_page_for_full_screenshot(page, log)
                         curr_h = get_screen_hash(page)
 
@@ -894,6 +929,27 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
 
                     if history_counts[curr_id] >= loop_limit:
                         log(f"Обнаружено зацикливание на {curr_u}. Остановка.")
+                        resolved = False
+                        try:
+                            resolved = try_ai_resolve_stuck(
+                                page=page,
+                                log_func=log,
+                                slug=slug,
+                                results_dir=res_dir,
+                                model=ai_cfg.model,
+                                max_calls=ai_cfg.max_calls_per_stuck,
+                                max_candidates=ai_cfg.max_candidates,
+                                text_char_limit=ai_cfg.text_char_limit,
+                                timeout_seconds=ai_cfg.timeout_seconds,
+                            )
+                        except Exception as e:
+                            log(f"AI fallback exception: {str(e)[:200]}")
+
+                        if resolved:
+                            history_counts[curr_id] = 0
+                            step += 1
+                            continue
+
                         result["error"] = "stuck_loop"
                         break
 
@@ -903,12 +959,26 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
 
                     try:
                         page.screenshot(path=local_path, full_page=True)
-                        shutil.copy2(local_path, os.path.join(classified_dir, st, f"{slug}__{screen_name}"))
+                        shutil.copy2(
+                            local_path,
+                            os.path.join(classified_dir, st, f"{slug}__{screen_name}"),
+                        )
                     except Exception as e:
                         log(f"Ошибка сохранения скриншота: {str(e)[:120]}")
 
-                    log(f"Шаг:{step} | тип:{st} | ui_step:{ui_before} | url:{page.url[:60]}")
-                    act = perform_action(page, st, log, res_dir, curr_h, curr_u, fill_values, repeat_attempt=repeat_attempt)
+                    log(
+                        f"Шаг:{step} | тип:{st} | ui_step:{ui_before} | url:{page.url[:60]}"
+                    )
+                    act = perform_action(
+                        page,
+                        st,
+                        log,
+                        res_dir,
+                        curr_h,
+                        curr_u,
+                        fill_values,
+                        repeat_attempt=repeat_attempt,
+                    )
 
                     time.sleep(1)
                     ui_after = get_ui_step(page)
@@ -918,8 +988,12 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                     result["steps_total"] = step
                     result["last_url"] = page.url
 
-                    if st in ['paywall', 'checkout'] or "stopped" in act or "reached" in act:
-                        if st in ['paywall', 'checkout'] or "paywall" in act:
+                    if (
+                        st in ["paywall", "checkout"]
+                        or "stopped" in act
+                        or "reached" in act
+                    ):
+                        if st in ["paywall", "checkout"] or "paywall" in act:
                             result["paywall_reached"] = True
                         break
 
@@ -937,8 +1011,8 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                     "paywall_reached": result["paywall_reached"],
                     "error": result["error"],
                 }
-                manifest_path = os.path.join(res_dir, 'manifest.json')
-                with open(manifest_path, 'w', encoding='utf-8') as mf:
+                manifest_path = os.path.join(res_dir, "manifest.json")
+                with open(manifest_path, "w", encoding="utf-8") as mf:
                     json.dump(manifest, mf, indent=2, ensure_ascii=False)
                 result["manifest_path"] = manifest_path
 
@@ -952,6 +1026,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
 # ====================
 # Запуск бота
 # ====================
+
 
 async def start_bot() -> None:
     """Запуск бота"""
