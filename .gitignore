@@ -11,5 +11,5 @@ client_secret.json
 token.pickle
 *.db
 nul
-/errors/*
+/errors
 /error_reports/*

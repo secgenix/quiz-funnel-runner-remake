@@ -93,13 +93,23 @@ def get_choices_text(page: Page, log_func=None):
             for i in range(els_count):
                 curr = els.nth(i)
                 if is_forbidden_button(curr, log_func): continue
-                txt = (curr.inner_text() or "").strip()
+                txt = safe_inner_text(curr, "")
                 if txt and not re.search(r'\d+\s*/\s*\d+', txt) and len(txt) < 100:
                     texts.append(txt)
             if texts:
                 return "|".join(texts[:3])
         return ""
     except: return ""
+
+
+def safe_inner_text(locator, fallback: str = "") -> str:
+    try:
+        return (locator.inner_text() or fallback).strip()
+    except:
+        try:
+            return (locator.evaluate("el => (el.innerText || el.textContent || '').trim()") or fallback).strip()
+        except:
+            return fallback
 
 def get_ui_step(page: Page):
     try:
@@ -379,7 +389,49 @@ def close_popups(page: Page, log_func):
         if hidden_fallback:
             cookie_found = True
             log_func("Cookie: скрыт fallback CSS")
-        
+
+        closed_modal = page.evaluate("""() => {
+            const isVisible = (el) => {
+                if (!el) return false;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 24 && r.height > 24;
+            };
+
+            const overlays = Array.from(document.querySelectorAll('*')).filter(el => {
+                if (!isVisible(el)) return false;
+                const s = window.getComputedStyle(el);
+                const txt = (el.innerText || '').toLowerCase();
+                const r = el.getBoundingClientRect();
+                const fixedLike = ['fixed', 'sticky', 'absolute'].includes(s.position);
+                const helpLike = txt.includes('need some help') || txt.includes('we will be glad to assist') || txt.includes('support@');
+                const dialogLike = el.getAttribute('role') === 'dialog' || el.getAttribute('aria-modal') === 'true';
+                return fixedLike && r.width > window.innerWidth * 0.45 && r.height > 80 && (helpLike || dialogLike);
+            });
+
+            for (const overlay of overlays) {
+                const candidates = Array.from(overlay.querySelectorAll('button, [role="button"], a, div, span')).filter(isVisible);
+                for (const el of candidates) {
+                    const txt = [
+                        (el.innerText || '').trim(),
+                        (el.getAttribute('aria-label') || '').trim(),
+                        (el.getAttribute('title') || '').trim()
+                    ].join(' ').toLowerCase();
+                    const rect = el.getBoundingClientRect();
+                    const looksClose = txt === '×' || txt === 'x' || txt.includes('close') || txt.includes('dismiss');
+                    const smallCircle = rect.width <= 72 && rect.height <= 72;
+                    if (looksClose || smallCircle) {
+                        try { el.click(); return true; } catch (e) {}
+                    }
+                }
+            }
+            return false;
+        """)
+
+        if closed_modal:
+            log_func("Popup/modal: закрыт generic close fallback")
+
         if cookie_found:
             log_func("Cookie-баннер обнаружен")
             
@@ -842,8 +894,8 @@ def classify_screen(page: Page, log_func):
                 if any(k in p for k in ["email", "e-mail", "mail@"]): has_email_input = True; break
             except: pass
 
-    # If attributes are not enough, check if there is an input AND "email" keywords in text/URL
-    if not has_email_input and page.locator("input:not([type='hidden'])").count() > 0:
+    # If attributes are not enough, check if there is a genuinely fillable visible input AND email keywords.
+    if not has_email_input and page.locator(FILLABLE_INPUT_SELECTOR).count() > 0:
         if any(k in t for k in ["email", "e-mail", "СЌР»РµРєС‚СЂРѕРЅРЅР°СЏ РїРѕС‡С‚Р°", "Р°РґСЂРµСЃ РїРѕС‡С‚С‹"]):
             # Only if it's not a profile data screen (age, weight, etc.)
             pd_kws = ["age", "height", "weight", "name", "СЂРѕСЃС‚", "РІРµСЃ", "РІРѕР·СЂР°СЃС‚", "РёРјСЏ"]
@@ -875,7 +927,7 @@ def classify_screen(page: Page, log_func):
     ]
     
     # Get all potential interactive elements
-    raw_els = page.locator("[data-testid*='answer' i]:visible, [class*='Card' i]:not([class*='testimonial' i]):not([class*='review' i]):visible, label:visible, button:visible, a:visible, [role='button']:visible, div[role='button']:visible")
+    raw_els = page.locator("[data-testid*='answer' i]:visible, [class*='Card' i]:not([class*='testimonial' i]):not([class*='review' i]):visible, [class*='button' i]:visible, [class*='btn' i]:visible, label:visible, button:visible, a:visible, [role='button']:visible, div[role='button']:visible")
     
     choices = []
     nav_btns = []
@@ -894,7 +946,7 @@ def classify_screen(page: Page, log_func):
         }""")
         if not is_int: continue
 
-        txt = (el.inner_text() or "").lower().strip()
+        txt = safe_inner_text(el, "").lower().strip()
         
         if not txt:
             tag = el.evaluate("el => el.tagName").lower()
@@ -1053,6 +1105,234 @@ def try_click_continue_js(page: Page, log_func) -> bool:
         log_func(f"JS CTA fallback: ошибка: {str(e)[:80]}")
     return False
 
+
+def try_click_question_option_js(page: Page, log_func, repeat_attempt: int = 0, prefer_skip: bool = False) -> bool:
+    """
+    Универсальный JS fallback для экранов-вопросов.
+    Ищет не CTA, а именно вероятные варианты ответа, включая кастомные кнопки
+    без текста (например, иконки/числовые value/карточки со SVG).
+    """
+    try:
+        result = page.evaluate(r"""(params) => {
+            const repeatAttempt = params.repeatAttempt || 0;
+            const preferSkip = !!params.preferSkip;
+            const negative = [
+                'cookie','cookies','privacy','settings','preferences','manage','share',
+                'view more','show less','read more','back','zurück','назад',
+                'continue','next','start','submit','got it','let\'s do it','let’s do it'
+            ];
+            const skipTexts = [
+                'skip this question', 'skip question', 'skip this step', 'skip step',
+                'skip for now', 'skip', 'not sure yet', 'decide later'
+            ];
+
+            const isVisible = (el) => {
+                if (!el) return false;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 18 && r.height > 18 && r.bottom > 0 && r.right > 0;
+            };
+
+            const isDisabled = (el) => {
+                const aria = (el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                const dis = !!el.disabled || el.hasAttribute('disabled');
+                return aria || dis;
+            };
+
+            const clickable = (el) => {
+                const t = (el.tagName || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                const s = window.getComputedStyle(el);
+                return t === 'button' || t === 'label' || t === 'input' || t === 'a' || role === 'button' || typeof el.onclick === 'function' || s.cursor === 'pointer';
+            };
+
+            const getText = (el) => {
+                const txt = (el.innerText || '').trim();
+                const aria = (el.getAttribute('aria-label') || '').trim();
+                const value = (el.getAttribute('value') || '').trim();
+                const alt = (el.getAttribute('alt') || '').trim();
+                return [txt, aria, value, alt].filter(Boolean).join(' ').trim();
+            };
+
+            const candidates = Array.from(document.querySelectorAll(
+                "button, [role='button'], label, [data-testid], [class], li, div"
+            ));
+
+            const scored = [];
+            for (let i = 0; i < candidates.length; i++) {
+                const el = candidates[i];
+                if (!isVisible(el) || isDisabled(el) || !clickable(el)) continue;
+
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                const text = getText(el);
+                const full = `${text} ${(el.className || '')} ${(el.getAttribute('data-testid') || '')}`.toLowerCase();
+                const isSkip = skipTexts.some(k => full.includes(k));
+                if (negative.some(k => full.includes(k)) && !(preferSkip && isSkip)) continue;
+
+                let score = 0;
+                const tag = (el.tagName || '').toLowerCase();
+                if (preferSkip && isSkip) score += 200;
+                if (tag === 'button') score += 25;
+                if ((el.getAttribute('role') || '').toLowerCase() === 'button') score += 15;
+                if (/(answer|option|choice|item|card|select)/i.test(full)) score += 40;
+                if (/^\d+(\.\d+)?$/.test((el.getAttribute('value') || '').trim())) score += 30;
+                if (el.querySelector('svg, img, canvas, path')) score += 18;
+                if (!text || text.length <= 40) score += 10;
+                if (rect.width >= 36 && rect.height >= 36) score += 10;
+                if (style.position !== 'fixed' && style.position !== 'sticky') score += 10;
+                if (rect.top > 40 && rect.bottom < window.innerHeight - 40) score += 8;
+                if (preferSkip && isSkip && rect.top > window.innerHeight * 0.55) score += 25;
+
+                const parent = el.parentElement;
+                if (parent) {
+                    const siblings = Array.from(parent.children).filter(sib => sib !== el && isVisible(sib));
+                    if (siblings.length >= 2) score += 8;
+                }
+
+                if (score < 20) continue;
+                scored.push({ index: i, score, text: text || (el.getAttribute('value') || '').trim() || '<icon-option>' });
+            }
+
+            if (!scored.length) return { clicked: false, text: null, count: 0 };
+
+            scored.sort((a, b) => b.score - a.score || a.index - b.index);
+            const unique = [];
+            const seen = new Set();
+            for (const item of scored) {
+                const key = `${item.text}::${item.index}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                unique.push(item);
+            }
+
+            const pick = unique[Math.min(repeatAttempt, unique.length - 1)];
+            const el = candidates[pick.index];
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            ['pointerdown','mousedown','mouseup','pointerup','click'].forEach(evt => {
+                try { el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+            });
+            try { el.click(); } catch (e) {}
+            return { clicked: true, text: pick.text || null, count: unique.length };
+        }""", {"repeatAttempt": repeat_attempt, "preferSkip": prefer_skip})
+
+        if result and result.get("clicked"):
+            log_func(
+                f"JS option fallback: клик по варианту '{(result.get('text') or '').strip()[:50]}' "
+                f"(кандидатов: {result.get('count', 0)})"
+            )
+            return True
+    except Exception as e:
+        log_func(f"JS option fallback: ошибка: {str(e)[:80]}")
+    return False
+
+
+def try_click_skip_question_js(page: Page, log_func) -> bool:
+    """
+    Универсальный fallback для шагов с явной ссылкой/кнопкой пропуска.
+    Нужен для календарей и других нестандартных шагов, где выбор может
+    зациклиться, но в UI есть безопасный выход через Skip.
+    """
+    try:
+        result = page.evaluate(r"""() => {
+            const skipTexts = [
+                'skip this question', 'skip question', 'skip this step', 'skip step',
+                'skip for now', 'skip', 'not sure yet', 'decide later'
+            ];
+
+            const isVisible = (el) => {
+                if (!el) return false;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 10 && r.height > 10 && r.bottom > 0 && r.right > 0;
+            };
+
+            const isDisabled = (el) => {
+                const aria = (el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                const dis = !!el.disabled || el.hasAttribute('disabled');
+                return aria || dis;
+            };
+
+            const getText = (el) => {
+                return [
+                    (el.innerText || '').trim(),
+                    (el.getAttribute('aria-label') || '').trim(),
+                    (el.getAttribute('title') || '').trim()
+                ].filter(Boolean).join(' ').trim();
+            };
+
+            const candidates = Array.from(document.querySelectorAll("a, button, [role='button'], label, div"));
+            let best = null;
+            let bestScore = -1;
+
+            for (const el of candidates) {
+                if (!isVisible(el) || isDisabled(el)) continue;
+                const txt = getText(el).toLowerCase();
+                if (!txt) continue;
+                if (!skipTexts.some(k => txt.includes(k))) continue;
+
+                const rect = el.getBoundingClientRect();
+                let score = 0;
+                if ((el.tagName || '').toLowerCase() === 'a') score += 20;
+                if ((el.tagName || '').toLowerCase() === 'button') score += 12;
+                if ((el.getAttribute('role') || '').toLowerCase() === 'button') score += 10;
+                if (txt.includes('skip this question')) score += 50;
+                if (txt.includes('skip question')) score += 40;
+                if (txt === 'skip') score += 10;
+                if (rect.top > window.innerHeight * 0.55) score += 10;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = { el, text: txt };
+                }
+            }
+
+            if (!best) return { clicked: false, text: null };
+
+            best.el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            ['pointerdown','mousedown','mouseup','pointerup','click'].forEach(evt => {
+                try { best.el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+            });
+            try { best.el.click(); } catch (e) {}
+            return { clicked: true, text: best.text || null };
+        }""")
+
+        if result and result.get("clicked"):
+            log_func(f"JS skip fallback: клик по '{(result.get('text') or '').strip()[:50]}'")
+            return True
+    except Exception as e:
+        log_func(f"JS skip fallback: ошибка: {str(e)[:80]}")
+    return False
+
+
+def is_calendar_question(page: Page) -> bool:
+    try:
+        return bool(page.evaluate(r"""() => {
+            return !!document.querySelector('.react-datepicker-wrapper, .react-datepicker, [class*="datepicker" i]');
+        }"""))
+    except:
+        return False
+
+
+def has_skip_question_control(page: Page) -> bool:
+    try:
+        return bool(page.evaluate(r"""() => {
+            const skipTexts = ['skip this question', 'skip question', 'skip this step', 'skip step', 'skip for now'];
+            const nodes = Array.from(document.querySelectorAll('a, button, [role="button"], label, div, span'));
+            return nodes.some(el => {
+                const txt = [
+                    (el.innerText || '').trim(),
+                    (el.getAttribute('aria-label') || '').trim(),
+                    (el.getAttribute('title') || '').trim()
+                ].filter(Boolean).join(' ').toLowerCase();
+                return txt && skipTexts.some(k => txt.includes(k));
+            });
+        }"""))
+    except:
+        return False
+
 def wait_for_transition(page: Page, old_url: str, old_hash: str, timeout=10.0):
     start = time.time()
     while time.time() - start < timeout:
@@ -1065,11 +1345,11 @@ def wait_for_transition(page: Page, old_url: str, old_hash: str, timeout=10.0):
 def detect_url_loop(page: Page, url_history: list, log_func) -> bool:
     """
     Детекция циклических переходов по URL.
-    Проверяем последние 3 URL в истории.
+    Проверяем последние 6 URL в истории.
     
     Returns True если обнаружен цикл
     """
-    if len(url_history) < 3:
+    if len(url_history) < 6:
         return False
     
     # Получаем базовые URL без query параметров для сравнения
@@ -1083,10 +1363,10 @@ def detect_url_loop(page: Page, url_history: list, log_func) -> bool:
         from urllib.parse import urlencode
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(filtered_query, doseq=True)}#{parsed.fragment}"
     
-    # Проверяем последние 3 URL
-    recent = [get_base_url(u) for u in url_history[-3:]]
+    # Проверяем последние 6 URL
+    recent = [get_base_url(u) for u in url_history[-6:]]
     if len(set(recent)) == 1:
-        log_func(f"Detected URL loop: одинаковый URL 3 раза подряд")
+        log_func(f"Detected URL loop: одинаковый URL 6 раз подряд")
         return True
     
     # Проверяем паттерн A -> B -> A
@@ -1239,7 +1519,7 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
 
             btn = find_continue_button(page, log_func)
             if btn:
-                btn_txt = " ".join((btn.inner_text() or "").split())
+                btn_txt = " ".join(safe_inner_text(btn, "").split())
                 log_func(f"Нажатие Continue: {btn_txt}")
                 close_popups(page, log_func)
                 try:
@@ -1335,11 +1615,16 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                                 continue
                         except:
                             pass
-                    txt = (curr.inner_text() or "").strip()
+                    txt = safe_inner_text(curr, "")
                     if txt and not re.search(r'^\d+\s*/\s*\d+$', txt) and len(txt) < 100 and not is_nav_button(txt):
                         text_targets.append(curr)
 
-            target_pool = text_targets
+            if screen_type == 'question' and is_calendar_question(page) and has_skip_question_control(page):
+                # Для календарных шагов не пытаемся бесконечно перебирать даты через обычный text target.
+                # Если после выбора дата не продвигает экран, ниже сработает fallback через Skip this question.
+                target_pool = []
+            else:
+                target_pool = text_targets
             target = None
             if target_pool:
                 # Улучшенный выбор: используем JS для получения уникальных идентификаторов элементов
@@ -1403,8 +1688,54 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                     target = target_pool[chosen_idx]
 
             if not target:
+                if screen_type == 'question':
+                    pre_option_hash = get_screen_hash(page)
+                    clicked_option = try_click_question_option_js(
+                        page,
+                        log_func,
+                        repeat_attempt=repeat_attempt,
+                        prefer_skip=is_calendar_question(page) and has_skip_question_control(page)
+                    )
+                    if clicked_option:
+                        moved = wait_for_transition(page, start_url, pre_option_hash, timeout=3.5)
+                        if moved:
+                            return "question_choice_clicked_js"
+
+                        curr_cont = find_continue_button(page, log_func)
+                        if curr_cont and curr_cont.is_enabled():
+                            c_txt = " ".join((curr_cont.inner_text() or "").split())
+                            log_func(f"После JS выбора нажимаю Continue: {c_txt}")
+                            close_popups(page, log_func)
+                            pre_cont_hash = get_screen_hash(page)
+                            try:
+                                curr_cont.click(force=True, timeout=1500)
+                            except:
+                                pass
+                            moved = wait_for_transition(page, page.url, pre_cont_hash, timeout=8.0)
+                            if moved:
+                                return "question_choice_clicked_js_continue"
+                            log_func("После JS выбора Continue не привел к переходу")
+
+                        if is_calendar_question(page):
+                            log_func("Обнаружен календарный шаг без доступного Continue. Пробую Skip")
+                            pre_skip_hash = get_screen_hash(page)
+                            if try_click_skip_question_js(page, log_func):
+                                moved = wait_for_transition(page, page.url, pre_skip_hash, timeout=8.0)
+                                if moved:
+                                    return "question_skipped_js"
+
+                    if is_calendar_question(page):
+                        log_func("Для календарного шага не найден валидный выбор. Пробую Skip")
+                        pre_skip_hash = get_screen_hash(page)
+                        if try_click_skip_question_js(page, log_func):
+                            moved = wait_for_transition(page, page.url, pre_skip_hash, timeout=8.0)
+                            if moved:
+                                return "question_skipped_js"
+
+                    return "no_choices_found"
+
                 if cont_btn:
-                    c_txt = " ".join((cont_btn.inner_text() or "").split())
+                    c_txt = " ".join(safe_inner_text(cont_btn, "").split())
                     log_func(f"Нет вариантов, нажимаю Continue: {c_txt}")
                     close_popups(page, log_func)
                     cont_btn.click(force=True, timeout=1000)
@@ -1421,7 +1752,7 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 return "no_choices_found"
             start_ui = get_ui_step(page)
             # 1. Click choice
-            clean_target_text = " ".join((target.inner_text() or "").split())
+            clean_target_text = " ".join(safe_inner_text(target, "").split())
             display_text = clean_target_text[:50] if clean_target_text else "<No text>"
             log_func(f"Нажатие выбора: {display_text}")
             try:
@@ -1492,7 +1823,7 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
 
                 curr_cont = find_continue_button(page, log_func)
                 if curr_cont and curr_cont.is_enabled():
-                    c_txt = " ".join((curr_cont.inner_text() or "").split())
+                    c_txt = " ".join(safe_inner_text(curr_cont, "").split())
                     log_func(f"Найдена кнопка Continue: {c_txt}. Нажимаю...")
                     close_popups(page, log_func)
                     pre_cont_hash = get_screen_hash(page)
@@ -1515,6 +1846,14 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                             return "continue_clicked_js"
                 time.sleep(0.5)
 
+            if screen_type == 'question' and is_calendar_question(page):
+                log_func("Календарный шаг не продвинулся после выбора. Пробую Skip")
+                pre_skip_hash = get_screen_hash(page)
+                if try_click_skip_question_js(page, log_func):
+                    moved = wait_for_transition(page, page.url, pre_skip_hash, timeout=8.0)
+                    if moved:
+                        return "question_skipped_js"
+
             # 3. Multiselect
             if not clicked_continue:
                 curr_cont = find_continue_button(page, log_func)
@@ -1525,7 +1864,7 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                         els_count = els.count()
                         for i in range(1, min(els_count, 5)):
                             curr = els.nth(i)
-                            txt = (curr.inner_text() or "").strip()
+                            txt = safe_inner_text(curr, "")
                             if txt and not re.search(r'^\d+\s*/\s*\d+$', txt) and not is_forbidden_button(curr, log_func):
                                 close_popups(page, log_func)
                                 curr.click(force=True, timeout=500)
@@ -1543,7 +1882,7 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
             if consent_checked:
                 curr_cont = find_continue_button(page, log_func)
                 if curr_cont and curr_cont.is_enabled():
-                    c_txt = " ".join((curr_cont.inner_text() or "").split())
+                    c_txt = " ".join(safe_inner_text(curr_cont, "").split())
                     log_func(f"После согласия нажимаю Continue: {c_txt}")
                     close_popups(page, log_func)
                     pre_consent_hash = get_screen_hash(page)
@@ -1766,4 +2105,3 @@ if __name__ == '__main__':
     for s in all_summaries:
         status = "УСПЕХ" if s['paywall_reached'] else "ОШИБКА"
         print(f"[{status}] URL: {s['url']} | Шагов: {s['steps_total']}")
-
