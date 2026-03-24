@@ -29,14 +29,11 @@
     "api_key": ""
   },
   "funnels": [
-    "https://quiz.theliven.com/en/3508_0iu33/?utm_source=facebook&utm_campaign={{campaign.id}}&utm_adset={{adset.id}}&utm%E2%80%A6=&visitor_id=51e2b2f2-46e2-48f6-8b0d-87e6ae3ddd7f",
-    "https://myiq.com/ru/start?id=5808a8650adceaed7faf15dbf2c819476dc6e5545515d9736443d3fb0d25e39e&e=7faf15",
-    "https://madmuscles.com/funnel/default-uni-soft-new/step-one?utm_source=facebook&camp_id=%7B%7Bcampaign.id%7D%7D&c%E2%80%A6=&rr=0&brr=1",
-    "https://quiz.finelo.com/dynamic",
-    "https://pilates.harnafit.com/quiz-hd/step-start?rr=0&brr=1",
-    "https://iq.mental-impulse.com/flow/iq_test_1",
-    "https://quiz.dressly.world/en/shop-amazon-smart-plan-hp?utm_source=facebook&utm_term=%7B%7Badset.id%7D%7D&utm_content=&device_id=f455c503-9272-469c-b04c-bcd6e7564713",
-    "https://paw-champ.com/questionary/quiz/quiz27?utm_source={{site_source_name}}&utm_medium={{placement}}&utm_campaign={{ca%E2%80%A6"
-
+"https://asknebula.com/flow/lp/simple-registration",
+"https://signup.ruutlabs.com/en/rcv/v2?gbUserId=fce",
+"https://quiz.wellverse.app/pr-tion",
+"https://skin.luvly.care/age-makeup?cohort=luvly_fl_makeup&lang=en&utm_source=%7B%7Bsite_source_name%7D%7D&utm_medium=cpm&ad_id=&uuid=a2d8df6e-0cd2-45c8-b3f3-e34c562b9a4b",
+"https://wf.epictok.me/proj_1ecb3f7327b543d499e605b4dd6640c5/flow_f523800b644c40cd8680e8effcc9f6d0?utm-source=%7B%7Bsite_sour%E2%80%A6",
+"https://quiz.the.coach/split_sias_new1?utm_source=%7B%7Bcampaign.name%7D%7D&utm_medium=%7B%7Badset.name%7D%7D&utm_campaign=%7B%7Bad.name%7D%7D&campaign_id=#gender_split"
   ]
 }

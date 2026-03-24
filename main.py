@@ -3,6 +3,10 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, Page, TimeoutError
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from datetime import datetime
+
+# Директория для сохранения артефактов ошибок
+ERRORS_DIR = "errors"
 
 COOKIE_BLACKLIST = [
     "settings", "preferences", "customize", "options", "more info", 
@@ -30,6 +34,11 @@ CONSENT_TEXT_KEYS = [
 
 
 def is_forbidden_button(el, log_func=None) -> bool:
+    """
+    Проверка кнопки на "запрещенность" (cookie, share и т.п.)
+    
+    Универсальная проверка - не маркируем варианты выбора (male/female и т.п.) как cookie
+    """
     try:
         txt = (el.inner_text() or "").lower()
         alabel = (el.get_attribute("aria-label") or "").lower()
@@ -39,9 +48,25 @@ def is_forbidden_button(el, log_func=None) -> bool:
 
         forbidden = False
         reason = ""
-        if any(word in full_text for word in COOKIE_BLACKLIST):
-            forbidden = True
-            reason = "cookie"
+        
+        # Проверяем на cookie-кнопки - только если есть явные маркеры cookie/settings
+        # Не маркируем простые варианты выбора как cookie
+        cookie_indicators = ["cookie", "cookies", "privacy settings", "cookie settings", 
+                           "preferences", "customize", "options", "more info",
+                           "einstellungen", "optionen", "mehr informationen",
+                           "cookie settings", "privacy settings", "datenschutzeinstellungen",
+                           "manage cookies", "cookie policy"]
+        
+        if any(indicator in full_text for indicator in cookie_indicators):
+            # Дополнительная проверка - если это явно вариант выбора (короткий текст без cookie-терминов)
+            # то не считаем его запрещенным
+            if txt.strip() and len(txt.strip()) < 20 and "cookie" not in txt and "settings" not in txt:
+                # Это вероятно вариант выбора, а не cookie кнопка
+                pass
+            else:
+                forbidden = True
+                reason = "cookie"
+        
         if FORBIDDEN_PATTERN.search(full_text):
             forbidden = True
             reason = "forbidden_ui"
@@ -125,6 +150,161 @@ def get_screen_hash(page: Page):
         t = page.evaluate("() => (document.body.innerText || '').slice(0, 10000)")
         return hashlib.md5(t.encode('utf-8')).hexdigest()
     except: return ""
+
+
+def save_error_artifacts(page: Page, url: str, error_message: str, log_lines: list, log_func) -> str:
+    """
+    Сохраняет DOM-дерево, код страницы, скриншот и логи при ошибке.
+    
+    Args:
+        page: Playwright страница
+        url: URL где произошла ошибка
+        error_message: Описание ошибки
+        log_lines: Список строк лога
+        log_func: Функция логирования
+    
+    Returns:
+        Путь к папке с артефактами ошибки
+    """
+    try:
+        # Создаем папку для ошибок
+        os.makedirs(ERRORS_DIR, exist_ok=True)
+        
+        # Генерируем имя папки на основе домена и timestamp
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace('www.', '')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        error_folder = os.path.join(ERRORS_DIR, f"{domain}_{timestamp}")
+        os.makedirs(error_folder, exist_ok=True)
+        
+        log_func(f"Сохранение артефактов ошибки в {error_folder}")
+        
+        # 1. Сохраняем DOM-дерево
+        try:
+            dom_content = page.evaluate("() => document.documentElement.outerHTML")
+            dom_path = os.path.join(error_folder, "dom.html")
+            with open(dom_path, 'w', encoding='utf-8') as f:
+                f.write(dom_content)
+            log_func(f"DOM сохранен: {dom_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения DOM: {str(e)[:80]}")
+        
+        # 2. Сохраняем весь JavaScript код со страницы
+        try:
+            scripts_content = []
+            scripts = page.query_selector_all("script")
+            for idx, script in enumerate(scripts):
+                try:
+                    src = script.get_attribute("src")
+                    if src:
+                        # Внешний скрипт - сохраняем ссылку
+                        scripts_content.append(f"/* External script: {src} */")
+                    else:
+                        # Inline скрипт - сохраняем содержимое
+                        inner_html = script.inner_text() or script.evaluate("el => el.innerHTML")
+                        if inner_html:
+                            scripts_content.append(f"/* Inline script #{idx} */\n{inner_html}")
+                except:
+                    pass
+            
+            scripts_path = os.path.join(error_folder, "scripts.js")
+            with open(scripts_path, 'w', encoding='utf-8') as f:
+                f.write('\n\n'.join(scripts_content[:50]))  # Ограничиваем 50 скриптами
+            log_func(f"Скрипты сохранены: {scripts_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения скриптов: {str(e)[:80]}")
+        
+        # 3. Сохраняем CSS стили
+        try:
+            styles_content = []
+            styles = page.query_selector_all("style, link[rel='stylesheet']")
+            for idx, style in enumerate(styles[:30]):  # Ограничиваем 30 стилями
+                try:
+                    href = style.get_attribute("href")
+                    if href:
+                        styles_content.append(f"/* External stylesheet: {href} */")
+                    else:
+                        inner_html = style.inner_text() or style.evaluate("el => el.innerHTML")
+                        if inner_html:
+                            styles_content.append(f"/* Inline style #{idx} */\n{inner_html}")
+                except:
+                    pass
+            
+            styles_path = os.path.join(error_folder, "styles.css")
+            with open(styles_path, 'w', encoding='utf-8') as f:
+                f.write('\n\n'.join(styles_content))
+            log_func(f"Стили сохранены: {styles_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения стилей: {str(e)[:80]}")
+        
+        # 4. Сохраняем скриншот
+        try:
+            screenshot_path = os.path.join(error_folder, "screenshot.png")
+            page.screenshot(path=screenshot_path, full_page=True)
+            log_func(f"Скриншот сохранен: {screenshot_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения скриншота: {str(e)[:80]}")
+        
+        # 5. Сохраняем логи
+        try:
+            log_path = os.path.join(error_folder, "error_log.txt")
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write(f"URL: {url}\n")
+                f.write(f"Ошибка: {error_message}\n")
+                f.write(f"Время: {datetime.now().isoformat()}\n")
+                f.write(f"User Agent: {page.evaluate('() => navigator.userAgent')}\n")
+                f.write(f"Viewport: {page.evaluate('() => JSON.stringify({width: window.innerWidth, height: window.innerHeight})')}\n")
+                f.write("\n=== Логи ===\n\n")
+                f.write('\n'.join(log_lines[-200:]))  # Последние 200 строк лога
+            log_func(f"Логи сохранены: {log_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения логов: {str(e)[:80]}")
+        
+        # 6. Сохраняем информацию о странице (metadata)
+        try:
+            metadata = {
+                "url": url,
+                "error": error_message,
+                "timestamp": datetime.now().isoformat(),
+                "user_agent": page.evaluate("() => navigator.userAgent"),
+                "viewport": {
+                    "width": page.evaluate("() => window.innerWidth"),
+                    "height": page.evaluate("() => window.innerHeight"),
+                },
+                "page_title": page.title(),
+                "cookies_count": len(page.context.cookies()),
+                "local_storage": page.evaluate("() => { try { return Object.keys(localStorage).length; } catch(e) { return 0; } }"),
+                "session_storage": page.evaluate("() => { try { return Object.keys(sessionStorage).length; } catch(e) { return 0; } }"),
+            }
+            metadata_path = os.path.join(error_folder, "metadata.json")
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            log_func(f"Метаданные сохранены: {metadata_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения метаданных: {str(e)[:80]}")
+        
+        # 7. Сохраняем console.log ошибки если есть
+        try:
+            console_errors = page.evaluate("""() => {
+                if (window.__qwen_console_errors) {
+                    return window.__qwen_console_errors;
+                }
+                return [];
+            }""")
+            if console_errors:
+                console_path = os.path.join(error_folder, "console_errors.txt")
+                with open(console_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(console_errors))
+                log_func(f"Console ошибки сохранены: {console_path}")
+        except:
+            pass
+        
+        log_func(f"✅ Артефакты ошибки сохранены в {error_folder}")
+        return error_folder
+        
+    except Exception as e:
+        log_func(f"❌ Критическая ошибка при сохранении артефактов: {str(e)[:120]}")
+        return ""
 
 def close_popups(page: Page, log_func):
     try:
@@ -316,6 +496,240 @@ def ensure_consent_checkbox_checked(page: Page, log_func) -> bool:
         return checked_any
     except:
         return False
+
+
+def check_and_handle_form_blockers(page: Page, log_func) -> bool:
+    """
+    Универсальная JS-функция для обнаружения и обработки блокираторов форм:
+    - Отсутствующие обязательные поля
+    - Disabled кнопки
+    - Скрытые ошибки валидации
+    - Блокирующие overlay
+    
+    Returns True если были обнаружены и обработаны блокираторы
+    """
+    try:
+        blockers_handled = page.evaluate("""() => {
+            let handled = false;
+            
+            // 1. Проверяем есть ли disabled кнопка Continue/Next с незаполненными полями
+            const disabledButtons = Array.from(document.querySelectorAll('button:disabled, [disabled] button, [aria-disabled="true"]'));
+            const continueKeywords = ['continue', 'next', 'get started', 'submit', 'start', 'get my'];
+            
+            for (const btn of disabledButtons) {
+                const txt = (btn.innerText || '').toLowerCase();
+                if (continueKeywords.some(k => txt.includes(k))) {
+                    // Кнопка disabled - ищем незаполненные обязательные поля
+                    const requiredInputs = Array.from(document.querySelectorAll('input[required]:not([type="hidden"]), textarea[required]'));
+                    const emptyRequired = requiredInputs.filter(inp => !inp.value || inp.value.trim() === '');
+                    
+                    if (emptyRequired.length > 0) {
+                        // Пытаемся заполнить первое пустое поле
+                        const firstEmpty = emptyRequired[0];
+                        if (firstEmpty.type === 'email') {
+                            firstEmpty.value = 'test' + Date.now() + '@gmail.com';
+                        } else if (firstEmpty.type === 'tel') {
+                            firstEmpty.value = '1234567890';
+                        } else if (firstEmpty.type === 'number') {
+                            firstEmpty.value = '25';
+                        } else {
+                            firstEmpty.value = 'John';
+                        }
+                        firstEmpty.dispatchEvent(new Event('input', { bubbles: true }));
+                        firstEmpty.dispatchEvent(new Event('change', { bubbles: true }));
+                        handled = true;
+                        break;
+                    }
+                }
+            }
+            
+            // 2. Проверяем наличие overlay блокирующих клики
+            const overlays = Array.from(document.querySelectorAll('*')).filter(el => {
+                const style = window.getComputedStyle(el);
+                return (
+                    style.position === 'fixed' && 
+                    style.zIndex && 
+                    parseInt(style.zIndex) > 1000 &&
+                    style.display !== 'none' &&
+                    style.opacity !== '0' &&
+                    el.offsetWidth > window.innerWidth * 0.5 &&
+                    el.offsetHeight > window.innerHeight * 0.5
+                );
+            });
+            
+            for (const overlay of overlays) {
+                // Проверяем не является ли это cookie-баннером
+                const overlayText = (overlay.innerText || '').toLowerCase();
+                if (!overlayText.includes('cookie') && !overlayText.includes('privacy')) {
+                    // Пытаемся скрыть overlay
+                    overlay.style.display = 'none';
+                    overlay.style.visibility = 'hidden';
+                    overlay.style.pointerEvents = 'none';
+                    handled = true;
+                }
+            }
+            
+            // 3. Проверяем скрытые ошибки валидации
+            const errorMessages = Array.from(document.querySelectorAll('[role="alert"], .error-message, .validation-error, [class*="error" i], [class*="invalid" i]'));
+            for (const err of errorMessages) {
+                if (err.offsetWidth > 0 && err.offsetHeight > 0) {
+                    const errText = (err.innerText || '').toLowerCase();
+                    if (errText.includes('required') || errText.includes('must') || errText.includes('valid')) {
+                        // Находим связанное поле и пытаемся исправить
+                        const relatedInput = err.querySelector('input') || 
+                                           document.querySelector('input:focus') ||
+                                           document.querySelector('input[aria-invalid="true"]');
+                        if (relatedInput) {
+                            relatedInput.value = relatedInput.type === 'email' ? 
+                                'test@gmail.com' : 'John';
+                            relatedInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            handled = true;
+                        }
+                    }
+                }
+            }
+            
+            // 4. Проверяем чекбоксы согласия которые могут блокировать
+            const consentCheckboxes = Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(cb => {
+                const label = cb.closest('label') || document.querySelector(`label[for="${cb.id}"]`);
+                const labelTxt = (label?.innerText || '').toLowerCase();
+                return labelTxt.includes('agree') || labelTxt.includes('terms') || labelTxt.includes('privacy');
+            });
+            
+            for (const cb of consentCheckboxes) {
+                if (!cb.checked) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', { bubbles: true }));
+                    handled = true;
+                }
+            }
+            
+            return handled;
+        }""")
+        
+        if blockers_handled:
+            log_func("Form blockers: обнаружены и обработаны блокираторы формы через JS")
+        
+        return blockers_handled
+        
+    except Exception as e:
+        log_func(f"Form blockers: ошибка проверки: {str(e)[:80]}")
+        return False
+
+
+def detect_page_stuck_state(page: Page, log_func) -> dict:
+    """
+    JS-функция для детекции "зависшего" состояния страницы.
+    Возвращает информацию о состоянии и рекомендации.
+    
+    Returns:
+        dict с полями: is_stuck, reason, suggestion
+    """
+    try:
+        stuck_info = page.evaluate("""() => {
+            const result = {
+                is_stuck: false,
+                reason: null,
+                suggestion: null,
+                details: {}
+            };
+            
+            // 1. Проверяем наличие активных loading индикаторов
+            const loadingElements = Array.from(document.querySelectorAll('[class*="loading" i], [class*="spinner" i], [role="progressbar"]'));
+            const visibleLoading = loadingElements.some(el => {
+                const style = window.getComputedStyle(el);
+                return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+            });
+            
+            if (visibleLoading) {
+                result.is_stuck = true;
+                result.reason = 'loading_in_progress';
+                result.suggestion = 'wait_longer';
+                result.details.loading_count = loadingElements.length;
+                return result;
+            }
+            
+            // 2. Проверяем есть ли незаполненные обязательные поля при disabled кнопке
+            const disabledContinue = Array.from(document.querySelectorAll('button:disabled')).find(btn => {
+                const txt = (btn.innerText || '').toLowerCase();
+                return ['continue', 'next', 'get started', 'submit'].some(k => txt.includes(k));
+            });
+            
+            if (disabledContinue) {
+                const requiredEmpty = Array.from(document.querySelectorAll('input[required]:not([type="hidden"])'))
+                    .filter(inp => !inp.value || inp.value.trim() === '');
+                
+                if (requiredEmpty.length > 0) {
+                    result.is_stuck = true;
+                    result.reason = 'required_fields_empty';
+                    result.suggestion = 'fill_required_fields';
+                    result.details.empty_fields = requiredEmpty.length;
+                    return result;
+                }
+            }
+            
+            // 3. Проверяем наличие blocking iframe (например cookie consent)
+            const iframes = Array.from(document.querySelectorAll('iframe'));
+            const blockingIframe = iframes.find(iframe => {
+                const style = window.getComputedStyle(iframe);
+                return (
+                    style.position === 'fixed' &&
+                    style.zIndex && 
+                    parseInt(style.zIndex) > 999 &&
+                    iframe.offsetWidth > window.innerWidth * 0.8 &&
+                    iframe.offsetHeight > window.innerHeight * 0.8
+                );
+            });
+            
+            if (blockingIframe) {
+                result.is_stuck = true;
+                result.reason = 'blocking_iframe';
+                result.suggestion = 'close_iframe_or_wait';
+                result.details.iframe_src = blockingIframe.src;
+                return result;
+            }
+            
+            // 4. Проверяем наличие JavaScript ошибок в консоли
+            if (window.__qwen_console_errors && window.__qwen_console_errors.length > 0) {
+                const recentErrors = window.__qwen_console_errors.slice(-5);
+                const hasBlockingError = recentErrors.some(err => 
+                    err.includes('Uncaught') || 
+                    err.includes('TypeError') || 
+                    err.includes('ReferenceError')
+                );
+                
+                if (hasBlockingError) {
+                    result.is_stuck = true;
+                    result.reason = 'javascript_errors';
+                    result.suggestion = 'try_click_anyway_or_reload';
+                    result.details.errors = recentErrors;
+                    return result;
+                }
+            }
+            
+            // 5. Проверяем наличие скрытого контента который должен быть виден
+            const hiddenContent = document.querySelector('[class*="hidden" i], [aria-hidden="true"]');
+            if (hiddenContent) {
+                // Проверяем не является ли это ожидаемым состоянием
+                const expectedHidden = ['cookie', 'modal', 'popup', 'overlay'];
+                const hiddenClass = (hiddenContent.className || '').toLowerCase();
+                if (!expectedHidden.some(h => hiddenClass.includes(h))) {
+                    // Возможно контент должен быть виден
+                    result.details.potentially_hidden = true;
+                }
+            }
+            
+            return result;
+        }""")
+        
+        if stuck_info.get('is_stuck'):
+            log_func(f"Stuck state: reason={stuck_info['reason']}, suggestion={stuck_info['suggestion']}")
+        
+        return stuck_info
+        
+    except Exception as e:
+        log_func(f"Stuck state detection: ошибка: {str(e)[:80]}")
+        return {"is_stuck": False, "reason": "error", "suggestion": None}
 
 DEBUG_CLASSIFY = True
 WORKOUT_ISSUES_STEP_KEY = "stepid=step-workout-issues"
@@ -536,8 +950,11 @@ def find_continue_button(page: Page, log_func=None):
         'Submit', 'Show my results', 'See my results', "Let's", "Do it", "I'm in",
         'Got it', 'Got it!'
     ]
-    # Restrict to actual interactive elements to avoid picking up headlines/prompts
-    button_locator = page.locator("button:visible, [role='button']:visible, a.button:visible, a:visible")
+    # Restrict to likely interactive elements to avoid picking up headlines/prompts
+    button_locator = page.locator(
+        "button:visible, [role='button']:visible, a.button:visible, a:visible, "
+        "input[type='submit']:visible, input[type='button']:visible"
+    )
     
     for text in keywords:
         # We search within buttons/links for the text
@@ -556,12 +973,130 @@ def find_continue_button(page: Page, log_func=None):
     # the bot to mistakenly click choice variants as 'Next' buttons.
     return None
 
+
+def try_click_continue_js(page: Page, log_func) -> bool:
+    """
+    Универсальный JS fallback для клика по CTA-кнопке продолжения.
+    Полезно для кастомных div-кнопок (React/Next), где нет <button>.
+    """
+    try:
+        result = page.evaluate(r"""() => {
+            const positive = [
+                'continue','next','proceed','submit','start','get started','get my',
+                'show results','see results','go on','keep going','continue quiz',
+                'continuar','continuar >','weiter','suivant','продолжить'
+            ];
+            const negative = [
+                'cookie','privacy','settings','preferences','manage','share','back','zurück','назад'
+            ];
+
+            const isVisible = (el) => {
+                if (!el) return false;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 8 && r.height > 8 && r.bottom > 0 && r.right > 0;
+            };
+
+            const isDisabled = (el) => {
+                const aria = (el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                const dis = !!el.disabled || el.hasAttribute('disabled');
+                return aria || dis;
+            };
+
+            const candidates = Array.from(document.querySelectorAll(
+                "button, [role='button'], a, input[type='submit'], input[type='button'], div, span"
+            ));
+
+            let best = null;
+            let bestScore = -1;
+            for (const el of candidates) {
+                if (!isVisible(el) || isDisabled(el)) continue;
+
+                const txt = ((el.innerText || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase());
+                if (!txt || txt.length > 120) continue;
+                if (negative.some(k => txt.includes(k))) continue;
+                if (!positive.some(k => txt.includes(k))) continue;
+
+                const st = window.getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                let score = 0;
+
+                score += 50;
+                if (el.tagName === 'BUTTON') score += 20;
+                if (el.getAttribute('role') === 'button') score += 12;
+                if (st.cursor === 'pointer') score += 10;
+                if (r.top > window.innerHeight * 0.45) score += 10; // CTA чаще внизу экрана
+                if (txt === 'continue' || txt === 'next' || txt === 'continuar') score += 8;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = { el, txt };
+                }
+            }
+
+            if (!best) return { clicked: false, text: null };
+
+            const el = best.el;
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            ['pointerdown','mousedown','mouseup','pointerup','click'].forEach(evt => {
+                try { el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+            });
+            try { el.click(); } catch (e) {}
+            return { clicked: true, text: best.txt || null };
+        }""")
+
+        if result and result.get("clicked"):
+            log_func(f"JS CTA fallback: клик по кнопке '{(result.get('text') or '').strip()[:50]}'")
+            return True
+    except Exception as e:
+        log_func(f"JS CTA fallback: ошибка: {str(e)[:80]}")
+    return False
+
 def wait_for_transition(page: Page, old_url: str, old_hash: str, timeout=10.0):
     start = time.time()
     while time.time() - start < timeout:
         if page.url != old_url or get_screen_hash(page) != old_hash:
             return True
         time.sleep(0.5)
+    return False
+
+
+def detect_url_loop(page: Page, url_history: list, log_func) -> bool:
+    """
+    Детекция циклических переходов по URL.
+    Проверяем последние 3 URL в истории.
+    
+    Returns True если обнаружен цикл
+    """
+    if len(url_history) < 3:
+        return False
+    
+    # Получаем базовые URL без query параметров для сравнения
+    def get_base_url(url):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        # Игнорируем некоторые параметры которые могут меняться
+        exclude_params = ['timestamp', 't', '_', 'rnd', 'rand']
+        query_params = parse_qs(parsed.query)
+        filtered_query = {k: v for k, v in query_params.items() if k not in exclude_params}
+        from urllib.parse import urlencode
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(filtered_query, doseq=True)}#{parsed.fragment}"
+    
+    # Проверяем последние 3 URL
+    recent = [get_base_url(u) for u in url_history[-3:]]
+    if len(set(recent)) == 1:
+        log_func(f"Detected URL loop: одинаковый URL 3 раза подряд")
+        return True
+    
+    # Проверяем паттерн A -> B -> A
+    if len(url_history) >= 2:
+        base_current = get_base_url(page.url)
+        base_prev = get_base_url(url_history[-2])
+        if base_current == base_prev:
+            log_func(f"Detected URL loop: возврат на предыдущий URL")
+            return True
+    
     return False
 
 
@@ -601,6 +1136,28 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
             return "stopped at paywall"
         if screen_type == 'paywall': return "stopped at paywall"
         if screen_type == 'checkout': return "checkout reached"
+
+        # Проверяем наличие file upload/input[type="file"]
+        file_input = page.locator('input[type="file"]').first
+        if file_input.count() > 0:
+            log_func("Обнаружен file upload - создаем пустой файл и загружаем")
+            try:
+                # Создаем временный файл с тестовым изображением
+                import base64
+                # Минимальное PNG изображение (1x1 прозрачный пиксель)
+                png_data = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==')
+                temp_file = os.path.join(results_dir, 'temp_upload.png')
+                with open(temp_file, 'wb') as f:
+                    f.write(png_data)
+                file_input.set_input_files(temp_file)
+                time.sleep(1)
+                log_func("Файл загружен, ожидаем перехода...")
+                wait_for_transition(page, start_url, start_hash, timeout=5.0)
+                return "file_uploaded"
+            except Exception as e:
+                log_func(f"Ошибка загрузки файла: {str(e)[:80]}")
+                # Пробуем просто кликнуть если загрузка не сработала
+                pass
 
         if screen_type in ['email', 'input']:
             checked = ensure_privacy_checkbox_checked(page, log_func)
@@ -712,10 +1269,15 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                         pass
                 if try_click_got_it(page, log_func, timeout=8.0):
                     return "continue_clicked"
-            # Priority to "Start" buttons
-            if cont_btn and any(k in (cont_btn.inner_text() or "").lower() for k in ["start", "get my", "get started", "take the", "offer", "claim", "discount", "spin"]):
+            # Priority to "Start" buttons only on info-like screens.
+            # For question screens this often causes loops when real action is selecting an option first.
+            if screen_type == 'info' and cont_btn and any(k in (cont_btn.inner_text() or "").lower() for k in ["start", "get my", "get started", "take the", "offer", "claim", "discount", "spin"]):
                 c_txt = " ".join((cont_btn.inner_text() or "").split())
                 log_func(f"Найдена кнопка старта: {c_txt}. Нажимаю...")
+                
+                # Проверяем и обрабатываем блокираторы формы перед кликом
+                check_and_handle_form_blockers(page, log_func)
+
                 close_popups(page, log_func)
                 pre_start_hash = get_screen_hash(page)
                 cont_btn.click(force=True, timeout=1000)
@@ -725,6 +1287,14 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                     return "stopped at paywall"
                 if not moved and get_screen_hash(page) == pre_start_hash:
                     log_func("Клик по старту не изменил экран")
+                    # Повторная проверка блокираторов если клик не сработал
+                    if check_and_handle_form_blockers(page, log_func):
+                        log_func("Повторный клик после обработки блокираторов")
+                        pre_start_hash2 = get_screen_hash(page)
+                        cont_btn.click(force=True, timeout=1000)
+                        moved = wait_for_transition(page, start_url, pre_start_hash2, timeout=5.0)
+                        if moved:
+                            return "start_button_pressed_retry"
                 return "start_button_pressed"
 
             choice_sel = [
@@ -732,10 +1302,12 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 "button:visible", 
                 "[class*='Item' i]:visible", 
                 "[class*='Card' i]:visible", 
+                "[class*='option' i]:visible",
+                "[class*='answer' i]:visible",
+                "[class*='choice' i]:visible",
                 "label:visible"
             ]
             text_targets = []
-            empty_targets = []
             # Pass 1: Try all selectors to find a choice WITH text (excluding Nav)
             for s in choice_sel:
                 els = page.locator(s)
@@ -743,6 +1315,19 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 for i in range(els_count):
                     curr = els.nth(i)
                     if is_forbidden_button(curr, log_func): continue
+                    try:
+                        is_int = curr.evaluate("""el => {
+                            const t = (el.tagName || '').toLowerCase();
+                            if (t === 'button' || t === 'a' || t === 'label' || t === 'input') return true;
+                            if ((el.getAttribute('role') || '').toLowerCase() === 'button') return true;
+                            if (typeof el.onclick === 'function') return true;
+                            const st = window.getComputedStyle(el);
+                            return st.cursor === 'pointer';
+                        }""")
+                        if not is_int:
+                            continue
+                    except:
+                        pass
                     if is_workout_issues:
                         try:
                             cb = curr.locator("input[type='checkbox']").first
@@ -754,26 +1339,68 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                     if txt and not re.search(r'^\d+\s*/\s*\d+$', txt) and len(txt) < 100 and not is_nav_button(txt):
                         text_targets.append(curr)
 
-            # Pass 2: If no text choices found, try all selectors for empty choices
-            if not text_targets:
-                for s in choice_sel:
-                    els = page.locator(s)
-                    els_count = els.count()
-                    for i in range(els_count):
-                        curr = els.nth(i)
-                        if is_forbidden_button(curr, log_func): continue
-                        if not (curr.inner_text() or "").strip():
-                            tag = curr.evaluate("el => el.tagName").lower()
-                            if tag in ['button', 'input']:
-                                empty_targets.append(curr)
-
-            target_pool = text_targets if text_targets else empty_targets
+            target_pool = text_targets
             target = None
             if target_pool:
-                chosen_idx = repeat_attempt % len(target_pool)
-                target = target_pool[chosen_idx]
-                if len(target_pool) > 1 and repeat_attempt > 0:
-                    log_func(f"Повтор шага: пробую альтернативный вариант #{chosen_idx + 1} из {len(target_pool)}")
+                # Улучшенный выбор: используем JS для получения уникальных идентификаторов элементов
+                # Это помогает отличать элементы с одинаковым текстом но разными данными
+                element_hashes = []
+                for el in target_pool:
+                    try:
+                        el_hash = el.evaluate("""el => {
+                            // Генерируем уникальный хеш для элемента на основе:
+                            // - Позиции в DOM
+                            // - Атрибутов (id, class, data-*)
+                            // - Соседних элементов
+                            const attrs = {
+                                id: el.id,
+                                class: el.className,
+                                role: el.getAttribute('role'),
+                                'data-testid': el.getAttribute('data-testid'),
+                                'data-index': el.getAttribute('data-index'),
+                                type: el.getAttribute('type'),
+                                name: el.getAttribute('name')
+                            };
+                            
+                            // Позиция родителя
+                            const parent = el.parentElement;
+                            const parentClass = parent?.className || '';
+                            const siblingIndex = Array.from(parent?.children || []).indexOf(el);
+                            
+                            return JSON.stringify({
+                                attrs,
+                                parentClass,
+                                siblingIndex,
+                                tagName: el.tagName
+                            });
+                        }""")
+                        element_hashes.append(el_hash)
+                    except:
+                        element_hashes.append(None)
+                
+                # Если есть повторная попытка, выбираем элемент с уникальным хешем
+                if repeat_attempt > 0 and len(target_pool) > 1:
+                    # Получаем хеши уже кликнутого элемента
+                    clicked_hash = element_hashes[0] if element_hashes else None
+                    
+                    # Ищем элемент с отличающимся хешем
+                    found_different = False
+                    for idx, el_hash in enumerate(element_hashes):
+                        if el_hash and el_hash != clicked_hash:
+                            chosen_idx = idx
+                            target = target_pool[chosen_idx]
+                            found_different = True
+                            log_func(f"Повтор шага: выбран альтернативный элемент #{chosen_idx + 1} (уникальный хеш)")
+                            break
+                    
+                    # Если все элементы одинаковые, пробуем кликнуть по следующему
+                    if not found_different:
+                        chosen_idx = repeat_attempt % len(target_pool)
+                        target = target_pool[chosen_idx]
+                        log_func(f"Повтор шага: все элементы одинаковые, пробую #{chosen_idx + 1}")
+                else:
+                    chosen_idx = 0
+                    target = target_pool[chosen_idx]
 
             if not target:
                 if cont_btn:
@@ -785,6 +1412,12 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                     if moved:
                         return "info_continue_pressed"
                     log_func("Continue не изменил экран")
+                else:
+                    pre_js_hash = get_screen_hash(page)
+                    if try_click_continue_js(page, log_func):
+                        moved = wait_for_transition(page, start_url, pre_js_hash, timeout=8.0)
+                        if moved:
+                            return "info_continue_pressed_js"
                 return "no_choices_found"
             start_ui = get_ui_step(page)
             # 1. Click choice
@@ -875,6 +1508,11 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                         if try_click_got_it(page, log_func, timeout=got_it_timeout):
                             return "continue_clicked"
                     log_func("Continue нажат, но переход не произошел")
+                    pre_js_hash = get_screen_hash(page)
+                    if try_click_continue_js(page, log_func):
+                        moved_js = wait_for_transition(page, page.url, pre_js_hash, timeout=8.0)
+                        if moved_js:
+                            return "continue_clicked_js"
                 time.sleep(0.5)
 
             # 3. Multiselect
@@ -936,36 +1574,69 @@ def run_funnel(url: str, config: dict, is_headless: bool):
     classified_dir = os.path.join('results', '_classified')
     for cat in ['question', 'info', 'input', 'email', 'paywall', 'other', 'checkout']:
         os.makedirs(os.path.join(classified_dir, cat), exist_ok=True)
-    
+
     summary = {"url": url, "slug": slug, "steps_total": 0, "paywall_reached": False, "last_url": "", "path": res_dir, "error": None}
     max_steps = int(config.get("max_steps", 80))
     slow_mo = int(config.get("slow_mo_ms", 100))
     fill_values = resolve_fill_values(config)
     
+    # Список для хранения логов (нужен для сохранения при ошибке)
+    log_lines = []
+
     with open(os.path.join(res_dir, 'log.txt'), 'w', encoding='utf-8') as f:
         def log(m):
-            l = f"[{time.strftime('%H:%M:%S')}] {m}\n"; f.write(l); print(l.strip())
+            l = f"[{time.strftime('%H:%M:%S')}] {m}\n"
+            f.write(l)
+            print(l.strip())
+            log_lines.append(l.strip())
+        
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=is_headless, slow_mo=slow_mo)
                 page = browser.new_context(**p.devices['iPhone 13']).new_page()
+                
+                # Перехватываем console.error для сбора JS ошибок
+                console_errors = []
+                def handle_console(msg):
+                    if msg.type == "error":
+                        console_errors.append(f"[{msg.type}] {msg.text}")
+                        # Сохраняем в глобальный объект для последующего извлечения
+                        try:
+                            page.evaluate("""(text) => {
+                                if (!window.__qwen_console_errors) {
+                                    window.__qwen_console_errors = [];
+                                }
+                                window.__qwen_console_errors.push(text);
+                                if (window.__qwen_console_errors.length > 100) {
+                                    window.__qwen_console_errors.shift();
+                                }
+                            }""", msg.text)
+                        except:
+                            pass
+                page.on("console", handle_console)
+                
                 log(f"Переход на {url} (slug: {slug})")
                 try:
                     page.goto(url, wait_until='load', timeout=60000)
                 except TimeoutError:
                     summary["error"] = "navigation_timeout"
                     log("Ошибка: таймаут открытия страницы")
+                    # Сохраняем артефакты при ошибке навигации
+                    save_error_artifacts(page, url, "navigation_timeout", log_lines, log)
                     browser.close()
                     return summary
-            
+
                 step = 1
                 history_counts = defaultdict(int)
                 step_attempts = defaultdict(int)
+                last_error_artifacts_saved = False
+                url_history = [page.url]  # История URL для детекции циклов
+                
                 while step <= max_steps:
                     curr_u = page.url
-                    if any(k in curr_u for k in ["magic", "analyzing", "loading", "preparePlan"]): 
+                    if any(k in curr_u for k in ["magic", "analyzing", "loading", "preparePlan"]):
                         time.sleep(10); curr_u = page.url
-                    
+
                     close_popups(page, log)
                     time.sleep(1)
                     curr_h = get_screen_hash(page)
@@ -977,15 +1648,18 @@ def run_funnel(url: str, config: dict, is_headless: bool):
                     step_key = f"{urlparse(curr_u).path}|{ui_before}|{st}"
                     repeat_attempt = step_attempts[step_key]
                     step_attempts[step_key] += 1
-                    
+
                     curr_id = f"{curr_u}|{curr_h}"
                     history_counts[curr_id] += 1
                     loop_limit = 8 if WORKOUT_ISSUES_STEP_KEY in curr_u.lower() else 3
                     if history_counts[curr_id] >= loop_limit:
                         log(f"Обнаружено зацикливание на {curr_u}. Остановка.")
                         summary["error"] = "stuck_loop"
+                        # Сохраняем артефакты при зацикливании
+                        save_error_artifacts(page, url, "stuck_loop", log_lines, log)
+                        last_error_artifacts_saved = True
                         break
-                    
+
                     screen_name = f"{step:02d}_{st}.png"
                     local_path = os.path.join(res_dir, screen_name)
                     try:
@@ -993,37 +1667,55 @@ def run_funnel(url: str, config: dict, is_headless: bool):
                         shutil.copy2(local_path, os.path.join(classified_dir, st, f"{slug}__{screen_name}"))
                     except Exception as e:
                         log(f"Ошибка сохранения скриншота: {str(e)[:120]}")
-                    
+
                     log(f"Шаг:{step} | тип:{st} | ui_step:{ui_before} | url:{page.url[:60]}")
                     act = perform_action(page, st, log, res_dir, curr_h, curr_u, fill_values, repeat_attempt=repeat_attempt)
-                    
+
                     time.sleep(1)
                     ui_after = get_ui_step(page)
-                    
+
                     def parse_ui(s):
                         if not s or s == "unknown": return -1
                         m = re.match(r'(\d+)', s)
                         return int(m.group(1)) if m else -1
-                    
+
                     ui_b_num = parse_ui(ui_before)
                     ui_a_num = parse_ui(ui_after)
-                    
+
                     if ui_a_num > ui_b_num + 1 and ui_b_num > 0:
                         log(f"Обнаружен пропуск шага UI: {ui_before} -> {ui_after}")
-                    
+
                     log(f"Результат действия:{act}")
+
+                    # Добавляем URL в историю
+                    url_history.append(page.url)
+                    # Проверяем на циклы
+                    if detect_url_loop(page, url_history, log):
+                        log(f"Обнаружен циклический переход. Пробуем альтернативное действие.")
+                        # Увеличиваем счетчик попыток для текущего шага
+                        step_attempts[step_key] = min(step_attempts[step_key] + 2, 5)
                     
                     summary["steps_total"] = step; summary["last_url"] = page.url
                     if st in ['paywall', 'checkout'] or "stopped" in act or "reached" in act:
                         if st in ['paywall', 'checkout'] or "paywall" in act:
                             summary["paywall_reached"] = True
                         break
-                    
+
                     step += 1
+                
+                # Если была ошибка и артефакты еще не сохранены - сохраняем
+                if summary["error"] and not last_error_artifacts_saved:
+                    save_error_artifacts(page, url, summary["error"], log_lines, log)
+                
                 browser.close()
         except Exception as e:
             summary["error"] = f"runner_exception:{str(e)[:180]}"
             log(f"Критическая ошибка раннера: {str(e)[:180]}")
+            # Сохраняем артефакты при критической ошибке
+            try:
+                save_error_artifacts(page, url, summary["error"], log_lines, log)
+            except:
+                pass
     return summary
 
 if __name__ == '__main__':

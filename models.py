@@ -437,3 +437,19 @@ class TaskManager:
 
         conn.close()
         return user_ids
+
+    async def get_all_tasks(self, limit: int = 100) -> List[FunnelTask]:
+        """Получение всех задач (для отправки архива)"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM tasks
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (limit,))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        return [FunnelTask.from_row(row) for row in rows]
