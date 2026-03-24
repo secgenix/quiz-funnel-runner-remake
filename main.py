@@ -4,6 +4,7 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from datetime import datetime
+from ai_fallback import run_ai_fallback, resolve_ai_fallback_settings
 
 # Директория для сохранения артефактов ошибок
 ERRORS_DIR = "errors"
@@ -809,7 +810,8 @@ def is_probable_paywall_url(url: str) -> bool:
 
 
 def resolve_fill_values(config: dict) -> dict:
-    fill = config.get("fill_values", {}) or {}
+    runner_cfg = config.get("runner", {}) if isinstance(config.get("runner"), dict) else {}
+    fill = config.get("fill_values", {}) or runner_cfg.get("fill_values", {}) or {}
     return {
         "name": str(fill.get("name", "John")),
         "email": str(fill.get("email", "testuser{ts}@gmail.com")),
@@ -820,6 +822,16 @@ def resolve_fill_values(config: dict) -> dict:
         "default_number": str(fill.get("default_number", "25")),
         "date_of_birth": str(fill.get("date_of_birth", "01/01/1990")),
     }
+
+
+def has_meaningful_progress(start_url: str, end_url: str, start_hash: str, end_hash: str, ui_before: str, ui_after: str) -> bool:
+    if (end_url or "") != (start_url or ""):
+        return True
+    if (end_hash or "") != (start_hash or ""):
+        return True
+    if (ui_before or "") != (ui_after or "") and (ui_after or "") != "unknown":
+        return True
+    return False
 
 
 def warmup_page_for_full_screenshot(page: Page, log_func) -> None:
@@ -1914,10 +1926,12 @@ def run_funnel(url: str, config: dict, is_headless: bool):
     for cat in ['question', 'info', 'input', 'email', 'paywall', 'other', 'checkout']:
         os.makedirs(os.path.join(classified_dir, cat), exist_ok=True)
 
+    runner_cfg = config.get("runner", {}) if isinstance(config.get("runner"), dict) else {}
     summary = {"url": url, "slug": slug, "steps_total": 0, "paywall_reached": False, "last_url": "", "path": res_dir, "error": None}
-    max_steps = int(config.get("max_steps", 80))
-    slow_mo = int(config.get("slow_mo_ms", 100))
+    max_steps = int(runner_cfg.get("max_steps", config.get("max_steps", 80)))
+    slow_mo = int(runner_cfg.get("slow_mo_ms", config.get("slow_mo_ms", 100)))
     fill_values = resolve_fill_values(config)
+    ai_settings = resolve_ai_fallback_settings(config)
     
     # Список для хранения логов (нужен для сохранения при ошибке)
     log_lines = []
@@ -1968,6 +1982,7 @@ def run_funnel(url: str, config: dict, is_headless: bool):
                 step = 1
                 history_counts = defaultdict(int)
                 step_attempts = defaultdict(int)
+                ai_attempts = defaultdict(int)
                 last_error_artifacts_saved = False
                 url_history = [page.url]  # История URL для детекции циклов
                 
@@ -1992,9 +2007,32 @@ def run_funnel(url: str, config: dict, is_headless: bool):
                     history_counts[curr_id] += 1
                     loop_limit = 8 if WORKOUT_ISSUES_STEP_KEY in curr_u.lower() else 3
                     if history_counts[curr_id] >= loop_limit:
+                        ai_budget = int(ai_settings.get("max_attempts_per_screen", 2))
+                        if ai_settings.get("enabled") and ai_attempts[curr_id] < ai_budget:
+                            ai_attempts[curr_id] += 1
+                            log(f"Обнаружено зацикливание на {curr_u}. Пробую AI fallback (attempt {ai_attempts[curr_id]}/{ai_budget})")
+                            fallback_result = run_ai_fallback(
+                                page=page,
+                                config=config,
+                                results_dir=res_dir,
+                                fill_values=fill_values,
+                                screen_type=st,
+                                stuck_reason="stuck_loop",
+                                repeat_attempt=repeat_attempt,
+                                ui_step=ui_before,
+                                screen_hash=curr_h,
+                                log_lines=log_lines,
+                                log_func=log,
+                            )
+                            log(f"AI fallback result: {fallback_result.get('status')} | reason={fallback_result.get('reason')}")
+                            time.sleep(1.5)
+                            after_ai_hash = get_screen_hash(page)
+                            after_ai_ui = get_ui_step(page)
+                            if has_meaningful_progress(curr_u, page.url, curr_h, after_ai_hash, ui_before, after_ai_ui):
+                                history_counts[curr_id] = 0
+                                continue
                         log(f"Обнаружено зацикливание на {curr_u}. Остановка.")
                         summary["error"] = "stuck_loop"
-                        # Сохраняем артефакты при зацикливании
                         save_error_artifacts(page, url, "stuck_loop", log_lines, log)
                         last_error_artifacts_saved = True
                         break
@@ -2025,6 +2063,37 @@ def run_funnel(url: str, config: dict, is_headless: bool):
                         log(f"Обнаружен пропуск шага UI: {ui_before} -> {ui_after}")
 
                     log(f"Результат действия:{act}")
+
+                    curr_hash_after_action = get_screen_hash(page)
+                    if ai_settings.get("enabled"):
+                        stuck_state = detect_page_stuck_state(page, log)
+                        no_progress = not has_meaningful_progress(curr_u, page.url, curr_h, curr_hash_after_action, ui_before, ui_after)
+                        ai_reason = None
+                        if stuck_state.get("is_stuck"):
+                            ai_reason = str(stuck_state.get("reason") or "stuck_state")
+                        elif no_progress and not any(k in act for k in ["paywall", "checkout", "reached", "stopped"]):
+                            ai_reason = "no_progress_after_action"
+
+                        ai_curr_id = f"{curr_u}|{curr_h}|{ui_before}|{st}"
+                        ai_budget = int(ai_settings.get("max_attempts_per_screen", 2))
+                        if ai_reason and ai_attempts[ai_curr_id] < ai_budget:
+                            ai_attempts[ai_curr_id] += 1
+                            log(f"AI fallback trigger: reason={ai_reason} | attempt {ai_attempts[ai_curr_id]}/{ai_budget}")
+                            fallback_result = run_ai_fallback(
+                                page=page,
+                                config=config,
+                                results_dir=res_dir,
+                                fill_values=fill_values,
+                                screen_type=st,
+                                stuck_reason=ai_reason,
+                                repeat_attempt=repeat_attempt,
+                                ui_step=ui_before,
+                                screen_hash=curr_h,
+                                log_lines=log_lines,
+                                log_func=log,
+                            )
+                            log(f"AI fallback result: {fallback_result.get('status')} | reason={fallback_result.get('reason')}")
+                            time.sleep(1.5)
 
                     # Добавляем URL в историю
                     url_history.append(page.url)

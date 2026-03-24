@@ -28,6 +28,16 @@
     "service": "2captcha",
     "api_key": ""
   },
+  "ai_fallback": {
+    "enabled": true,
+    "model": "gpt-5.4-nano",
+    "api_key_env": "OPENAI_API_KEY",
+    "confidence_threshold": 0.55,
+    "max_attempts_per_screen": 2,
+    "allow_paywall_navigation": true,
+    "save_traces": true,
+    "timeout_sec": 25
+  },
   "funnels": [
   "https://masterly.ai/promo/start?g=38276",
   "https://creators.betterme.world/quiz/flows/4429",
