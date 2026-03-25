@@ -790,23 +790,158 @@ WORKOUT_FREQUENCY_STEP_KEY = "stepid=step-workout-frequency"
 DATE_OF_BIRTH_STEP_KEY = "stepid=step-date-of-birth"
 
 
+PAYWALL_URL_KEYWORDS = [
+    "payment",
+    "paywall",
+    "pricing",
+    "subscription",
+    "subscribe",
+    "plan",
+    "plans",
+    "premium",
+    "membership",
+    "checkout",
+    "billing",
+    "purchase",
+    "order",
+]
+
+PAYWALL_PLAN_KEYWORDS = [
+    "pricing",
+    "plan",
+    "plans",
+    "subscription",
+    "subscribe",
+    "premium",
+    "membership",
+    "monthly",
+    "annual",
+    "yearly",
+    "weekly",
+    "starter",
+    "basic",
+    "pro",
+    "premium plan",
+    "best value",
+    "most popular",
+    "unlimited access",
+]
+
+PAYWALL_CTA_KEYWORDS = [
+    "subscribe",
+    "start trial",
+    "free trial",
+    "try free",
+    "continue with plan",
+    "choose plan",
+    "select plan",
+    "view plans",
+    "upgrade now",
+    "get premium",
+    "buy now",
+    "purchase",
+    "checkout",
+    "unlock now",
+    "get access",
+]
+
+PAYWALL_LIMITATION_KEYWORDS = [
+    "limited access",
+    "unlock full access",
+    "unlock premium",
+    "continue reading",
+    "members only",
+    "subscriber-only",
+    "subscription required",
+    "access denied",
+    "to continue",
+    "get unlimited access",
+    "full access",
+    "buy access",
+    "unlock your plan",
+]
+
+PAYWALL_TRIAL_KEYWORDS = [
+    "trial",
+    "free trial",
+    "start your trial",
+    "start free trial",
+    "7-day trial",
+    "3-day trial",
+    "cancel anytime",
+    "billed",
+    "per week",
+    "per month",
+    "per year",
+]
+
+PAYWALL_COMPARISON_KEYWORDS = [
+    "compare plans",
+    "plan comparison",
+    "what's included",
+    "features included",
+    "choose the plan",
+    "select the plan",
+]
+
+PAYWALL_PRICE_PATTERN = re.compile(
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))"
+)
+
+
 def is_probable_paywall_url(url: str) -> bool:
     try:
         u = (url or "").lower()
-        path = urlparse(u).path
-        paywall_path_keywords = [
-            "purchase",
-            "checkout",
-            "subscription",
-            "subscribe",
-            "pricing",
-            "paywall",
-            "billing",
-            "order"
-        ]
-        return any(k in path for k in paywall_path_keywords)
+        parsed = urlparse(u)
+        combined = " ".join([
+            parsed.netloc or "",
+            parsed.path or "",
+            parsed.query or "",
+            parsed.fragment or "",
+        ])
+        return any(k in combined for k in PAYWALL_URL_KEYWORDS)
     except:
         return False
+
+
+def detect_paywall_signals(page: Page) -> tuple[bool, str]:
+    try:
+        text = page.evaluate("() => (document.body.innerText || '').toLowerCase()") or ""
+    except:
+        text = ""
+
+    url = (page.url or "").lower()
+    url_has_paywall_keyword = is_probable_paywall_url(url)
+
+    plan_hits = sum(1 for keyword in PAYWALL_PLAN_KEYWORDS if keyword in text)
+    cta_hits = sum(1 for keyword in PAYWALL_CTA_KEYWORDS if keyword in text)
+    limitation_hits = sum(1 for keyword in PAYWALL_LIMITATION_KEYWORDS if keyword in text)
+    trial_hits = sum(1 for keyword in PAYWALL_TRIAL_KEYWORDS if keyword in text)
+    comparison_hits = sum(1 for keyword in PAYWALL_COMPARISON_KEYWORDS if keyword in text)
+
+    has_price_symbol = any(symbol in text for symbol in ["$", "€", "£", "₽"])
+    has_price_amount = bool(PAYWALL_PRICE_PATTERN.search(text))
+    has_price = has_price_symbol or has_price_amount
+
+    has_plan_offer = plan_hits >= 2 or (plan_hits >= 1 and has_price)
+    has_subscription_cta = cta_hits >= 1
+    has_content_gating = limitation_hits >= 1
+    has_trial_offer = trial_hits >= 1
+    has_plan_comparison = comparison_hits >= 1 and (plan_hits >= 1 or has_price)
+
+    if url_has_paywall_keyword and (has_plan_offer or has_subscription_cta or has_content_gating or has_trial_offer or has_price):
+        return True, "Paywall keywords found in URL together with pricing/subscription content"
+
+    if has_price and (has_plan_offer or has_subscription_cta or has_trial_offer or has_plan_comparison):
+        return True, "Pricing combined with plans, CTA, trial, or comparison blocks"
+
+    if has_content_gating and (has_subscription_cta or has_trial_offer or has_plan_offer):
+        return True, "Content access restriction combined with subscription offer"
+
+    if has_plan_offer and has_subscription_cta and (has_trial_offer or has_plan_comparison):
+        return True, "Multiple paywall content signals detected"
+
+    return False, "No reliable paywall signals detected"
 
 
 def resolve_fill_values(config: dict) -> dict:
@@ -873,19 +1008,14 @@ def classify_screen(page: Page, log_func):
         return debug_return('checkout', "Checkout keywords or card inputs found")
 
     # 2. Paywall
-    has_price = any(k in t for k in ["в‚¬", "$", "ВЈ", "в‚Ѕ"]) or re.search(r'\d+[.,]\d+\s*[в‚¬$ВЈв‚Ѕ]', t)        
-    has_billing = any(k in t for k in ["subscribe", "trial", "billed", "week plan", "month plan", "pricing", "plans"])
-    has_cta = any(k in t for k in ["get my plan", "checkout", "start trial"])
-    is_subscription_url = any(k in u for k in ["subscriptions-utc", "subscription", "pricing", "paywall", "checkout"])
+    is_paywall, paywall_reason = detect_paywall_signals(page)
     is_madmuscles_final_url = "madmuscles.com/final/" in u
     if (
         ("coursiv.io" in u and "selling-page" in u)
-        or (has_price and has_billing and has_cta)
-        or is_subscription_url
-        or is_probable_paywall_url(u)
+        or is_paywall
         or is_madmuscles_final_url
     ):
-        return debug_return('paywall', "Paywall signals detected")
+        return debug_return('paywall', paywall_reason)
 
     # 3. Game/Prize/Spin screens (should be info)
     game_kws = ["spin", "wheel", "prize"]
@@ -1574,8 +1704,12 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 pre_start_hash = get_screen_hash(page)
                 cont_btn.click(force=True, timeout=1000)
                 moved = wait_for_transition(page, start_url, start_hash)
-                if not moved and is_probable_paywall_url(page.url):
-                    log_func("Страница похожа на paywall после клика старта")
+                if not moved:
+                    is_paywall, paywall_reason = detect_paywall_signals(page)
+                else:
+                    is_paywall, paywall_reason = False, ""
+                if not moved and is_paywall:
+                    log_func(f"Страница похожа на paywall после клика старта: {paywall_reason}")
                     return "stopped at paywall"
                 if not moved and get_screen_hash(page) == pre_start_hash:
                     log_func("Клик по старту не изменил экран")

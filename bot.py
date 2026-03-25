@@ -903,8 +903,14 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
 # Google Drive загрузка
 # ====================
 
-async def upload_to_google_drive(slug: str, result_dir: str, 
-                                 credentials_file: str, folder_id: str) -> Optional[str]:
+async def upload_to_google_drive(
+    slug: str,
+    result_dir: str,
+    credentials_file: str,
+    folder_id: str,
+    token_file: str = "token.json",
+    root_folder_name: str = "",
+) -> Optional[str]:
     """
     Загрузка результатов воронки в Google Drive
     
@@ -924,7 +930,12 @@ async def upload_to_google_drive(slug: str, result_dir: str,
             return None
         
         # Создаем загрузчик
-        uploader = GoogleDriveUploader(credentials_file, folder_id)
+        uploader = GoogleDriveUploader(
+            credentials_file=credentials_file,
+            folder_id=folder_id,
+            token_file=token_file,
+            root_folder_name=root_folder_name,
+        )
         
         if not uploader.service:
             logger.error("Не удалось инициализировать Google Drive сервис")
@@ -1127,6 +1138,8 @@ class TaskQueueProcessor:
                         result_dir=result.get("path", ""),
                         credentials_file=cfg.google_drive.credentials_file,
                         folder_id=cfg.google_drive.folder_id,
+                        token_file=cfg.google_drive.token_file,
+                        root_folder_name=cfg.google_drive.root_folder_name,
                     )
                 except Exception as e:
                     logger.error(f"Ошибка загрузки в Google Drive: {e}")

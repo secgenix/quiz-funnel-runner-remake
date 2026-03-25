@@ -44,7 +44,9 @@ class GoogleDriveConfig:
     """Конфигурация Google Drive"""
     enabled: bool = False
     credentials_file: str = "credentials.json"
+    token_file: str = "token.json"
     folder_id: str = ""  # ID корневой папки для загрузки
+    root_folder_name: str = "Quiz Funnel Runner Results"
 
 
 @dataclass
@@ -97,13 +99,29 @@ class Config:
         captcha_data = data.get("captcha", {})
         
         # Загружаем Google Drive настройки из .env (имеют приоритет)
+        drive_enabled_env = os.getenv("GOOGLE_DRIVE_ENABLED", "").strip().lower()
+        if drive_enabled_env in {"1", "true", "yes", "on"}:
+            drive_enabled = True
+        elif drive_enabled_env in {"0", "false", "no", "off"}:
+            drive_enabled = False
+        else:
+            drive_enabled = drive_data.get("enabled", False)
+
         drive_credentials_file = os.getenv("GOOGLE_DRIVE_CREDENTIALS_FILE", "").strip()
         if not drive_credentials_file:
             drive_credentials_file = drive_data.get("credentials_file", "credentials.json")
+
+        drive_token_file = os.getenv("GOOGLE_DRIVE_TOKEN_FILE", "").strip()
+        if not drive_token_file:
+            drive_token_file = drive_data.get("token_file", "token.json")
         
         drive_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
         if not drive_folder_id:
             drive_folder_id = drive_data.get("folder_id", "")
+
+        drive_root_folder_name = os.getenv("GOOGLE_DRIVE_ROOT_FOLDER_NAME", "").strip()
+        if not drive_root_folder_name:
+            drive_root_folder_name = drive_data.get("root_folder_name", "Quiz Funnel Runner Results")
 
         return cls(
             bot=BotConfig(
@@ -129,9 +147,11 @@ class Config:
                 }),
             ),
             google_drive=GoogleDriveConfig(
-                enabled=drive_data.get("enabled", False),
+                enabled=drive_enabled,
                 credentials_file=drive_credentials_file,
+                token_file=drive_token_file,
                 folder_id=drive_folder_id,
+                root_folder_name=drive_root_folder_name,
             ),
             captcha=CaptchaConfig(
                 enabled=captcha_data.get("enabled", False),
@@ -160,7 +180,9 @@ class Config:
             "google_drive": {
                 "enabled": self.google_drive.enabled,
                 "credentials_file": self.google_drive.credentials_file,
+                "token_file": self.google_drive.token_file,
                 "folder_id": self.google_drive.folder_id,
+                "root_folder_name": self.google_drive.root_folder_name,
             },
             "captcha": {
                 "enabled": self.captcha.enabled,
