@@ -40,6 +40,7 @@ class FunnelTask:
     log_path: Optional[str] = None
     manifest_path: Optional[str] = None
     drive_folder_url: Optional[str] = None
+    last_url: Optional[str] = None
     progress_message: str = ""
     current_step: int = 0
 
@@ -60,6 +61,7 @@ class FunnelTask:
             "log_path": self.log_path,
             "manifest_path": self.manifest_path,
             "drive_folder_url": self.drive_folder_url,
+            "last_url": self.last_url,
             "progress_message": self.progress_message,
             "current_step": self.current_step,
         }
@@ -82,8 +84,9 @@ class FunnelTask:
             log_path=row[11],
             manifest_path=row[12],
             drive_folder_url=row[13],
-            progress_message=row[14] or "",
-            current_step=row[15] or 0,
+            last_url=row[14],
+            progress_message=row[15] or "",
+            current_step=row[16] or 0,
         )
 
 
@@ -116,10 +119,16 @@ class TaskManager:
                 log_path TEXT,
                 manifest_path TEXT,
                 drive_folder_url TEXT,
+                last_url TEXT,
                 progress_message TEXT DEFAULT '',
                 current_step INTEGER DEFAULT 0
             )
         """)
+
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "last_url" not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN last_url TEXT")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS url_queue (
@@ -262,7 +271,8 @@ class TaskManager:
                            screenshot_path: Optional[str] = None,
                            log_path: Optional[str] = None,
                            manifest_path: Optional[str] = None,
-                           drive_folder_url: Optional[str] = None) -> None:
+                           drive_folder_url: Optional[str] = None,
+                           last_url: Optional[str] = None) -> None:
         """Завершение задачи с результатами"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
@@ -273,7 +283,8 @@ class TaskManager:
                 SET status = ?, completed_at = ?, steps_total = ?, 
                     paywall_reached = ?, error = ?, 
                     screenshot_path = ?, log_path = ?, 
-                    manifest_path = ?, drive_folder_url = ?
+                    manifest_path = ?, drive_folder_url = ?,
+                    last_url = ?
                 WHERE id = ?
             """, (
                 TaskStatus.FAILED.value if error else TaskStatus.COMPLETED.value,
@@ -285,6 +296,7 @@ class TaskManager:
                 log_path,
                 manifest_path,
                 drive_folder_url,
+                last_url,
                 task_id,
             ))
 

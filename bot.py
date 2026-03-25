@@ -227,6 +227,87 @@ def short_url(url: str, max_len: int = 60) -> str:
     return url if len(url) <= max_len else f"{url[:max_len - 1]}…"
 
 
+def normalize_url_for_compare(url: Optional[str]) -> str:
+    """Нормализует URL для сравнения без лишнего шума."""
+    if not url:
+        return ""
+    normalized = str(url).strip()
+    if not normalized:
+        return ""
+    return normalized.rstrip("/")
+
+
+def should_show_resume_url(start_url: Optional[str], current_url: Optional[str]) -> bool:
+    """Показывает resume URL только если он действительно отличается от стартового."""
+    start_norm = normalize_url_for_compare(start_url)
+    current_norm = normalize_url_for_compare(current_url)
+    return bool(current_norm and current_norm != start_norm)
+
+
+def format_error_summary(error: Optional[str]) -> str:
+    """Краткая, человеко-понятная сводка ошибки без технического шума."""
+    raw = (error or "").strip()
+    if not raw:
+        return "Ошибка выполнения"
+
+    mappings = {
+        "navigation_timeout": "Страница не открылась вовремя",
+        "stuck_loop": "Сценарий зациклился",
+        "Task stuck, cleared by user": "Задача была сброшена вручную",
+    }
+    if raw in mappings:
+        return mappings[raw]
+
+    if raw.startswith("runner_exception:"):
+        details = raw.split(":", 1)[1].strip()
+        return f"Сбой раннера: {details}" if details else "Сбой раннера"
+
+    compact = raw.replace("_", " ")
+    return compact[:160]
+
+
+def build_result_lines(task: FunnelTask, *, is_success: bool, resume_url: Optional[str] = None) -> List[str]:
+    """Единый компактный формат итоговых сообщений."""
+    lines: List[str] = []
+
+    if is_success:
+        lines.append("✅ <b>Успех</b>")
+        if task.paywall_reached:
+            lines.append("💳 Paywall найден")
+        else:
+            lines.append("📄 Сценарий завершен")
+    else:
+        lines.append("❌ <b>Ошибка</b>")
+        lines.append(f"⚠️ {format_error_summary(task.error)}")
+
+    lines.append(f"#️⃣ <b>#{task.id}</b>")
+    lines.append(f"🔗 <code>{short_url(task.url, 85)}</code>")
+
+    meta_parts: List[str] = []
+    if task.steps_total:
+        meta_parts.append(f"шагов: {task.steps_total}")
+    if task.completed_at:
+        duration = task.completed_at - (task.started_at or task.created_at)
+        meta_parts.append(f"{duration.total_seconds():.1f} сек")
+    if meta_parts:
+        lines.append(f"⏱ {' • '.join(meta_parts)}")
+
+    if resume_url:
+        lines.append(f"↩️ <a href='{resume_url}'>Продолжить с текущего места</a>")
+
+    if task.drive_folder_url:
+        lines.append(f"📁 <a href='{task.drive_folder_url}'>Drive</a>")
+
+    if is_success:
+        lines.append("📎 Скриншот: финальный экран")
+
+    return lines
+
+
+def build_result_text(task: FunnelTask, *, is_success: bool, resume_url: Optional[str] = None) -> str:
+    return "\n".join(build_result_lines(task, is_success=is_success, resume_url=resume_url))
+
+
 def find_paywall_screenshot(task: FunnelTask) -> Optional[str]:
     """Ищет скриншот paywall/checkout для успешной задачи"""
     candidates: List[Path] = []
@@ -385,7 +466,7 @@ async def notify_batch_start(bot: Bot, user_id: int, total_tasks: int) -> None:
     try:
         await bot.send_message(
             user_id,
-            f"🚀 Запуск задач: <b>{total_tasks}</b>",
+            f"🚀 <b>Запуск</b> • задач: {total_tasks}",
             parse_mode="HTML",
             reply_markup=build_main_menu(),
         )
@@ -401,7 +482,7 @@ async def notify_task_progress(bot: Bot, user_id: int, task: FunnelTask) -> None
             await bot.send_message(
                 user_id,
                 f"🔄 <b>#{task.id}</b> • {task.current_step}/{task.steps_total}\n"
-                f"{short_url(task.progress_message or '', 90)}",
+                f"{short_url(task.progress_message or 'Выполняется…', 90)}",
                 parse_mode="HTML",
                 reply_markup=build_main_menu(),
             )
@@ -412,7 +493,7 @@ async def notify_task_progress(bot: Bot, user_id: int, task: FunnelTask) -> None
 async def notify_task_complete(bot: Bot, user_id: int, task: FunnelTask) -> None:
     """Уведомление о завершении задачи"""
     try:
-        text = f"✅ <b>Готово</b>\n" + await get_task_status_text(task)
+        text = build_result_text(task, is_success=True)
 
         # Для успешного прохождения отправляем именно paywall/checkout скриншот (если найден)
         screenshot_to_send = task.screenshot_path
@@ -435,10 +516,25 @@ async def notify_task_complete(bot: Bot, user_id: int, task: FunnelTask) -> None
 
 
 async def notify_task_error(bot: Bot, user_id: int, task: FunnelTask, error: str) -> None:
-    """Сохранение ошибки в коллектор (без отправки в Telegram)"""
+    """Компактное уведомление об ошибке + сохранение в коллектор."""
     try:
-        # Не отправляем уведомление в Telegram, только логируем
         logger.warning(f"Ошибка задачи #{task.id}: {error[:200]}")
+
+        resume_url: Optional[str] = None
+        task_last_url = getattr(task, "last_url", None)
+        if should_show_resume_url(task.url, task_last_url):
+            resume_url = task_last_url
+
+        text = build_result_text(task, is_success=False, resume_url=resume_url)
+
+        if task.screenshot_path and os.path.exists(task.screenshot_path):
+            try:
+                photo = FSInputFile(task.screenshot_path)
+                await bot.send_photo(user_id, photo, caption=text, parse_mode="HTML", reply_markup=build_main_menu())
+            except Exception:
+                await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=build_main_menu())
+        else:
+            await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=build_main_menu())
         
         # Сохраняем в коллектор ошибок
         if error_collector:
@@ -1045,11 +1141,12 @@ class TaskQueueProcessor:
                 log_path=result.get("log_path"),
                 manifest_path=result.get("manifest_path"),
                 drive_folder_url=drive_url,
+                last_url=result.get("last_url"),
             )
             
             # Получаем обновленную задачу
             completed_task = await task_manager.get_task(task.id)
-            
+             
             # Уведомляем о завершении
             if result.get("error"):
                 await notify_task_error(bot, task.user_id, completed_task, result["error"])
@@ -1062,8 +1159,9 @@ class TaskQueueProcessor:
         except Exception as e:
             logger.error(f"Ошибка обработки задачи #{task.id}: {e}")
             await task_manager.update_status(task.id, TaskStatus.FAILED)
-            await task_manager.complete_task(task.id, 0, False, error=str(e))
-            await notify_task_error(bot, task.user_id, task, str(e))
+            await task_manager.complete_task(task.id, 0, False, error=str(e), last_url=task.url)
+            failed_task = await task_manager.get_task(task.id)
+            await notify_task_error(bot, task.user_id, failed_task or task, str(e))
             # Уведомляем процессор очереди о завершении задачи
             await queue_processor.increment_tasks_completed()
 
@@ -1100,6 +1198,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
         "slug": slug,
         "steps_total": 0,
         "paywall_reached": False,
+        "start_url": url,
         "last_url": "",
         "path": res_dir,
         "error": None,
@@ -1151,8 +1250,10 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
 
                 try:
                     page.goto(url, wait_until='load', timeout=60000)
+                    result["last_url"] = page.url or url
                 except TimeoutError:
                     result["error"] = "navigation_timeout"
+                    result["last_url"] = page.url or url
                     log("Ошибка: таймаут открытия страницы")
                     # Сохраняем артефакты при ошибке
                     try:
@@ -1199,6 +1300,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                     if history_counts[curr_id] >= loop_limit:
                         log(f"Обнаружено зацикливание на {curr_u}. Остановка.")
                         result["error"] = "stuck_loop"
+                        result["last_url"] = page.url or curr_u or url
                         # Сохраняем артефакты при зацикливании
                         try:
                             save_error_artifacts_main(page, url, result["error"], log_lines, log)
@@ -1246,10 +1348,12 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                 # Если была ошибка и артефакты еще не сохранены - сохраняем
                 if result["error"] and not last_error_artifacts_saved:
                     try:
+                        result["last_url"] = page.url or result.get("last_url") or url
                         save_error_artifacts_main(page, url, result["error"], log_lines, log)
                     except:
                         pass
 
+                result["last_url"] = page.url or result.get("last_url") or url
                 browser.close()
 
                 # Создаем manifest.json
@@ -1272,6 +1376,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
             log(f"Критическая ошибка раннера: {str(e)[:180]}")
             # Сохраняем артефакты при критической ошибке
             try:
+                result["last_url"] = locals().get("page").url if "page" in locals() and page else result.get("last_url") or url
                 save_error_artifacts_main(page, url, result["error"], log_lines, log)
             except:
                 pass

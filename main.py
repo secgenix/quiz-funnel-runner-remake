@@ -935,7 +935,7 @@ def classify_screen(page: Page, log_func):
         "next", "continue", "skip", "back", "weiter", "zurГјck", "next step", "proceed", 
         "got it", "ok", "okay", "great", "understood", "yes", "i'm in", "let's go", 
         "see results", "start", "РїСЂРёРЅСЏС‚СЊ", "РѕРє", "РЅР°С‡Р°С‚СЊ", "РїРѕРЅСЏС‚РЅРѕ", "С…РѕСЂРѕС€Рѕ",
-        "do it", "ready", "begin", "let's", "go", "transformation"
+        "do it", "ready", "begin", "let's", "go", "transformation", "continuar", "siguiente"
     ]
     
     # Get all potential interactive elements
@@ -1012,7 +1012,7 @@ def find_continue_button(page: Page, log_func=None):
         'Continue', 'Next', 'Get my plan', 'Start', 'Take the quiz', 
         'Get started', 'Start quiz', 'Get my offer', 'Next step', 'Proceed', 
         'Submit', 'Show my results', 'See my results', "Let's", "Do it", "I'm in",
-        'Got it', 'Got it!'
+        'Got it', 'Got it!', "continuar", "siguiente", 'weiter', 'suivant', 'РїСЂРѕРґРѕР»Р¶РёС‚СЊ', 'РїРѕРЅСЏС‚СЊ', 'РїСЂРёРЅСЏС‚СЊ', 'РѕРє', 'РЅР°С‡Р°С‚СЊ'
     ]
     # Restrict to likely interactive elements to avoid picking up headlines/prompts
     button_locator = page.locator(
