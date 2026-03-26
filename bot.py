@@ -61,7 +61,9 @@ from main import (
     check_and_handle_form_blockers,
     detect_page_stuck_state,
     detect_url_loop,
+    has_meaningful_progress,
 )
+from ai_fallback import run_ai_fallback, resolve_ai_fallback_settings
 
 from playwright.sync_api import sync_playwright, Page, TimeoutError
 from concurrent.futures import ThreadPoolExecutor
@@ -1547,11 +1549,30 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
     """
     from main import save_error_artifacts as save_error_artifacts_main
     
-    # Создаем временный конфиг для run_funnel
-    temp_config = {
+    raw_ai_fallback = config_dict.get("ai_fallback", {}) if isinstance(config_dict, dict) else {}
+    if not isinstance(raw_ai_fallback, dict) or not raw_ai_fallback:
+        try:
+            with open('config.json', 'r', encoding='utf-8') as cf:
+                raw_config = json.load(cf)
+            raw_ai_fallback = raw_config.get("ai_fallback", {}) if isinstance(raw_config.get("ai_fallback"), dict) else {}
+        except Exception:
+            raw_ai_fallback = {}
+
+    runner_section = config_dict.get("runner", {}) if isinstance(config_dict.get("runner"), dict) else {
         "max_steps": config_dict.get("max_steps", 80),
         "slow_mo_ms": config_dict.get("slow_mo_ms", 100),
         "fill_values": config_dict.get("fill_values", {}),
+    }
+
+    # Создаем временный конфиг для Telegram-раннера.
+    # Важно хранить и плоские ключи, и секции runner/ai_fallback, потому что
+    # часть функций читает старый формат, а AI fallback опирается на полную секцию.
+    temp_config = {
+        "max_steps": runner_section.get("max_steps", config_dict.get("max_steps", 80)),
+        "slow_mo_ms": runner_section.get("slow_mo_ms", config_dict.get("slow_mo_ms", 100)),
+        "fill_values": runner_section.get("fill_values", config_dict.get("fill_values", {})),
+        "runner": runner_section,
+        "ai_fallback": raw_ai_fallback,
     }
 
     slug = get_slug(url)
@@ -1581,6 +1602,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
     max_steps = temp_config.get("max_steps", 80)
     slow_mo = temp_config.get("slow_mo_ms", 100)
     fill_values = resolve_fill_values(temp_config)
+    ai_settings = resolve_ai_fallback_settings(temp_config)
 
     log_path = os.path.join(res_dir, 'log.txt')
     result["log_path"] = log_path
@@ -1685,6 +1707,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                 step = 1
                 history_counts = defaultdict(int)
                 step_attempts = defaultdict(int)
+                ai_attempts = defaultdict(int)
                 last_error_artifacts_saved = False
                 url_history = [page.url]  # История URL для детекции циклов
 
@@ -1721,6 +1744,31 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                     loop_limit = 8 if WORKOUT_ISSUES_STEP_KEY in curr_u.lower() else 3
 
                     if history_counts[curr_id] >= loop_limit:
+                        ai_budget = int(ai_settings.get("max_attempts_per_screen", 2))
+                        if ai_settings.get("enabled") and ai_attempts[curr_id] < ai_budget:
+                            ai_attempts[curr_id] += 1
+                            log(f"Обнаружено зацикливание на {curr_u}. Пробую AI fallback (attempt {ai_attempts[curr_id]}/{ai_budget})")
+                            fallback_result = run_ai_fallback(
+                                page=page,
+                                config=temp_config,
+                                results_dir=res_dir,
+                                fill_values=fill_values,
+                                screen_type=st,
+                                stuck_reason="stuck_loop",
+                                repeat_attempt=repeat_attempt,
+                                ui_step=ui_before,
+                                screen_hash=curr_h,
+                                log_lines=log_lines,
+                                log_func=log,
+                            )
+                            log(f"AI fallback result: {fallback_result.get('status')} | reason={fallback_result.get('reason')}")
+                            if interruptible_sleep(1.5, page):
+                                break
+                            after_ai_hash = get_screen_hash(page)
+                            after_ai_ui = get_ui_step(page)
+                            if has_meaningful_progress(curr_u, page.url, curr_h, after_ai_hash, ui_before, after_ai_ui):
+                                history_counts[curr_id] = 0
+                                continue
                         log(f"Обнаружено зацикливание на {curr_u}. Остановка.")
                         result["error"] = "stuck_loop"
                         result["last_url"] = page.url or curr_u or url
@@ -1753,6 +1801,38 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                     ui_after = get_ui_step(page)
 
                     log(f"Результат действия:{act}")
+
+                    curr_hash_after_action = get_screen_hash(page)
+                    if ai_settings.get("enabled"):
+                        stuck_state = detect_page_stuck_state(page, log)
+                        no_progress = not has_meaningful_progress(curr_u, page.url, curr_h, curr_hash_after_action, ui_before, ui_after)
+                        ai_reason = None
+                        if stuck_state.get("is_stuck"):
+                            ai_reason = str(stuck_state.get("reason") or "stuck_state")
+                        elif no_progress and not any(k in act for k in ["paywall", "checkout", "reached", "stopped"]):
+                            ai_reason = "no_progress_after_action"
+
+                        ai_curr_id = f"{curr_u}|{curr_h}|{ui_before}|{st}"
+                        ai_budget = int(ai_settings.get("max_attempts_per_screen", 2))
+                        if ai_reason and ai_attempts[ai_curr_id] < ai_budget:
+                            ai_attempts[ai_curr_id] += 1
+                            log(f"AI fallback trigger: reason={ai_reason} | attempt {ai_attempts[ai_curr_id]}/{ai_budget}")
+                            fallback_result = run_ai_fallback(
+                                page=page,
+                                config=temp_config,
+                                results_dir=res_dir,
+                                fill_values=fill_values,
+                                screen_type=st,
+                                stuck_reason=ai_reason,
+                                repeat_attempt=repeat_attempt,
+                                ui_step=ui_before,
+                                screen_hash=curr_h,
+                                log_lines=log_lines,
+                                log_func=log,
+                            )
+                            log(f"AI fallback result: {fallback_result.get('status')} | reason={fallback_result.get('reason')}")
+                            if interruptible_sleep(1.5, page):
+                                break
 
                     # Добавляем URL в историю
                     url_history.append(page.url)
