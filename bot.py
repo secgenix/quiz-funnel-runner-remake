@@ -33,7 +33,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import get_config, init_config
 from models import TaskManager, FunnelTask, TaskStatus
-from drive_uploader import GoogleDriveUploader
+from drive_uploader import GoogleDriveUploader, ParallelDriveUploadManager
 from google_links_reader import GoogleLinksReader, is_google_url
 
 # Импортируем функции из main.py
@@ -85,6 +85,7 @@ dp: Optional[Dispatcher] = None
 task_manager: Optional[TaskManager] = None
 thread_pool: Optional[ThreadPoolExecutor] = None
 drive_upload_executor: Optional[ThreadPoolExecutor] = None
+drive_upload_manager: Optional[ParallelDriveUploadManager] = None
 
 
 class ErrorData:
@@ -1466,8 +1467,8 @@ class TaskQueueProcessor:
                 stop_event,
             )
             
-            # Загрузка в Google Drive выполняется фоном и не блокирует цикл бота
-            drive_url = None
+            # Папка создается заранее, а файлы загружаются сразу после сохранения.
+            drive_url = result.get("drive_folder_url")
             
             # Обновляем результаты
             await task_manager.complete_task(
@@ -1498,30 +1499,6 @@ class TaskQueueProcessor:
             else:
                 await notify_task_complete(bot, task.user_id, completed_task)
 
-            if (
-                cfg.google_drive.enabled
-                and not result.get("error")
-                and not result.get("stopped")
-                and result.get("slug")
-                and result.get("path")
-                and drive_upload_queue is not None
-            ):
-                try:
-                    await drive_upload_queue.enqueue(
-                        DriveUploadJob(
-                            task_id=task.id,
-                            user_id=task.user_id,
-                            slug=result.get("slug", ""),
-                            result_dir=result.get("path", ""),
-                            credentials_file=cfg.google_drive.credentials_file,
-                            folder_id=cfg.google_drive.folder_id,
-                            token_file=cfg.google_drive.token_file,
-                            root_folder_name=cfg.google_drive.root_folder_name,
-                        )
-                    )
-                except Exception as e:
-                    logger.error(f"Не удалось поставить Google Drive upload в фон для task_id={task.id}: {e}")
-             
             # Уведомляем процессор очереди о завершении задачи
             await queue_processor.increment_tasks_completed()
 
@@ -1578,10 +1555,26 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
     slug = get_slug(url)
     res_dir = os.path.join('results', slug)
     os.makedirs(res_dir, exist_ok=True)
+    upload_run_id = f"task-{task_id or slug}"
 
     classified_dir = os.path.join('results', '_classified')
     for cat in ['question', 'info', 'input', 'email', 'paywall', 'other', 'checkout']:
         os.makedirs(os.path.join(classified_dir, cat), exist_ok=True)
+
+    drive_folder_url: Optional[str] = None
+    if drive_upload_manager is not None:
+        try:
+            drive_folder_url = drive_upload_manager.register_run(upload_run_id, slug, res_dir)
+        except Exception as e:
+            logger.error(f"Не удалось зарегистрировать Drive upload run {upload_run_id}: {e}")
+
+    def enqueue_drive_artifact(file_path: Optional[str], drive_subdir: str = "") -> None:
+        if not file_path or drive_upload_manager is None:
+            return
+        try:
+            drive_upload_manager.enqueue_file(upload_run_id, file_path, drive_subdir=drive_subdir)
+        except Exception as e:
+            logger.error(f"Не удалось поставить файл в Drive очередь: {file_path} | {e}")
 
     result = {
         "url": url,
@@ -1597,6 +1590,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
         "manifest_path": None,
         "stopped": False,
         "progress_message": "",
+        "drive_folder_url": drive_folder_url,
     }
 
     max_steps = temp_config.get("max_steps", 80)
@@ -1634,6 +1628,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                     local_path = os.path.join(res_dir, screen_name)
                     page.screenshot(path=local_path, full_page=True)
                     result["last_screenshot"] = local_path
+                    enqueue_drive_artifact(local_path)
             except Exception as screenshot_error:
                 log(f"Ошибка сохранения финального состояния при остановке: {str(screenshot_error)[:120]}")
 
@@ -1786,7 +1781,10 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
 
                     try:
                         page.screenshot(path=local_path, full_page=True)
-                        shutil.copy2(local_path, os.path.join(classified_dir, st, f"{slug}__{screen_name}"))
+                        classified_path = os.path.join(classified_dir, st, f"{slug}__{screen_name}")
+                        shutil.copy2(local_path, classified_path)
+                        enqueue_drive_artifact(local_path)
+                        enqueue_drive_artifact(classified_path, drive_subdir=f"_classified/{st}")
                     except Exception as e:
                         log(f"Ошибка сохранения скриншота: {str(e)[:120]}")
 
@@ -1879,6 +1877,14 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                 with open(manifest_path, 'w', encoding='utf-8') as mf:
                     json.dump(manifest, mf, indent=2, ensure_ascii=False)
                 result["manifest_path"] = manifest_path
+                enqueue_drive_artifact(log_path)
+                enqueue_drive_artifact(manifest_path)
+
+                if drive_upload_manager is not None:
+                    try:
+                        result["drive_folder_url"] = drive_upload_manager.finalize_run(upload_run_id) or result.get("drive_folder_url")
+                    except Exception as finalize_error:
+                        log(f"Ошибка финализации Drive загрузок: {str(finalize_error)[:120]}")
 
         except Exception as e:
             result["error"] = f"runner_exception:{str(e)[:180]}"
@@ -1889,6 +1895,14 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
                 save_error_artifacts_main(page, url, result["error"], log_lines, log)
             except:
                 pass
+        finally:
+            enqueue_drive_artifact(result.get("log_path"))
+            enqueue_drive_artifact(result.get("manifest_path"))
+            if drive_upload_manager is not None:
+                try:
+                    result["drive_folder_url"] = drive_upload_manager.finalize_run(upload_run_id) or result.get("drive_folder_url")
+                except Exception as finalize_error:
+                    logger.error(f"Не удалось финализировать Drive run {upload_run_id}: {finalize_error}")
 
     return result
 
@@ -1899,7 +1913,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
 
 async def start_bot() -> None:
     """Запуск бота"""
-    global bot, dp, task_manager, thread_pool, drive_upload_executor, error_collector, drive_upload_queue
+    global bot, dp, task_manager, thread_pool, drive_upload_executor, error_collector, drive_upload_queue, drive_upload_manager
 
     # Инициализация конфигурации
     init_config()
@@ -1918,6 +1932,17 @@ async def start_bot() -> None:
     drive_upload_executor = ThreadPoolExecutor(max_workers=max(1, cfg.google_drive.max_parallel_uploads))
     error_collector = ErrorCollector()
     drive_upload_queue = DriveUploadQueue()
+    drive_upload_manager = None
+    if cfg.google_drive.enabled:
+        drive_upload_manager = ParallelDriveUploadManager(
+            credentials_file=cfg.google_drive.credentials_file,
+            folder_id=cfg.google_drive.folder_id,
+            token_file=cfg.google_drive.token_file,
+            root_folder_name=cfg.google_drive.root_folder_name,
+            max_workers=max(1, cfg.google_drive.max_parallel_uploads),
+        )
+        drive_upload_manager.start()
+        drive_upload_manager.recover_pending_runs("results")
 
     # Регистрируем роутеры
     router = Router()
@@ -1959,20 +1984,23 @@ async def start_bot() -> None:
 
     # Запускаем процессор очереди
     await queue_processor.start()
-    await drive_upload_queue.start(cfg.google_drive.max_parallel_uploads)
+    await drive_upload_queue.start(1)
 
     await dp.start_polling(bot)
 
 
 async def stop_bot() -> None:
     """Остановка бота"""
-    global bot, thread_pool, drive_upload_executor, drive_upload_queue
+    global bot, thread_pool, drive_upload_executor, drive_upload_queue, drive_upload_manager
 
     # Останавливаем процессор очереди
     await queue_processor.stop()
 
     if drive_upload_queue:
         await drive_upload_queue.stop()
+
+    if drive_upload_manager:
+        drive_upload_manager.stop(wait=True)
 
     if bot:
         await bot.close()

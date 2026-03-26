@@ -23,7 +23,8 @@
     "credentials_file": "client_secret_1.json",
     "token_file": "token.json",
     "folder_id": "",
-    "root_folder_name": "Quiz Funnel Runner Results"
+    "root_folder_name": "Quiz Funnel Runner Results",
+    "max_parallel_uploads": 2
   },
   "captcha": {
     "enabled": false,

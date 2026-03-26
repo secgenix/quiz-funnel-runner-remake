@@ -47,7 +47,7 @@ class GoogleDriveConfig:
     token_file: str = "token.json"
     folder_id: str = ""  # ID корневой папки для загрузки
     root_folder_name: str = "Quiz Funnel Runner Results"
-    max_parallel_uploads: int = 1
+    max_parallel_uploads: int = 2
 
 
 @dataclass
@@ -129,9 +129,9 @@ class Config:
             try:
                 drive_max_parallel_uploads = max(1, int(drive_max_parallel_uploads_raw))
             except ValueError:
-                drive_max_parallel_uploads = max(1, int(drive_data.get("max_parallel_uploads", 1)))
+                drive_max_parallel_uploads = max(1, int(drive_data.get("max_parallel_uploads", 2)))
         else:
-            drive_max_parallel_uploads = max(1, int(drive_data.get("max_parallel_uploads", 1)))
+            drive_max_parallel_uploads = max(1, int(drive_data.get("max_parallel_uploads", 2)))
 
         return cls(
             bot=BotConfig(
