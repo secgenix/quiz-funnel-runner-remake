@@ -47,6 +47,7 @@ class GoogleDriveConfig:
     token_file: str = "token.json"
     folder_id: str = ""  # ID корневой папки для загрузки
     root_folder_name: str = "Quiz Funnel Runner Results"
+    max_parallel_uploads: int = 1
 
 
 @dataclass
@@ -123,6 +124,15 @@ class Config:
         if not drive_root_folder_name:
             drive_root_folder_name = drive_data.get("root_folder_name", "Quiz Funnel Runner Results")
 
+        drive_max_parallel_uploads_raw = os.getenv("GOOGLE_DRIVE_MAX_PARALLEL_UPLOADS", "").strip()
+        if drive_max_parallel_uploads_raw:
+            try:
+                drive_max_parallel_uploads = max(1, int(drive_max_parallel_uploads_raw))
+            except ValueError:
+                drive_max_parallel_uploads = max(1, int(drive_data.get("max_parallel_uploads", 1)))
+        else:
+            drive_max_parallel_uploads = max(1, int(drive_data.get("max_parallel_uploads", 1)))
+
         return cls(
             bot=BotConfig(
                 token=token,
@@ -152,6 +162,7 @@ class Config:
                 token_file=drive_token_file,
                 folder_id=drive_folder_id,
                 root_folder_name=drive_root_folder_name,
+                max_parallel_uploads=drive_max_parallel_uploads,
             ),
             captcha=CaptchaConfig(
                 enabled=captcha_data.get("enabled", False),
@@ -183,6 +194,7 @@ class Config:
                 "token_file": self.google_drive.token_file,
                 "folder_id": self.google_drive.folder_id,
                 "root_folder_name": self.google_drive.root_folder_name,
+                "max_parallel_uploads": self.google_drive.max_parallel_uploads,
             },
             "captcha": {
                 "enabled": self.captcha.enabled,

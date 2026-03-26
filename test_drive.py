@@ -46,6 +46,7 @@ def test_config():
     print(f"Folder ID: {cfg.google_drive.folder_id or '(не указан)'}")
     print(f"Token file: {cfg.google_drive.token_file}")
     print(f"Root folder name: {cfg.google_drive.root_folder_name or '(не указано)'}")
+    print(f"Max parallel uploads: {cfg.google_drive.max_parallel_uploads}")
     
     if not cfg.google_drive.enabled:
         print_result(False, "Google Drive отключен в config.json")
