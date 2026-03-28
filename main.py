@@ -19,7 +19,8 @@ COOKIE_BLACKLIST = [
 SHARE_BLACKLIST = [
     "share", "sharing", "tell a friend", "invite", "recommend",
     "РїРѕРґРµР»РёС‚СЊСЃСЏ", "РїРѕРґРµР»РёСЃСЊ", "СЂР°СЃСЃРєР°Р·Р°С‚СЊ", "РїСЂРёРіР»Р°СЃРёС‚СЊ",
-    "view more", "show less", "read more", "back", "zurГјck", "РЅР°Р·Р°Рґ"
+    "view more", "show less", "read more", "back", "zurГјck", "РЅР°Р·Р°Рґ",
+    "previous", "go back", "edit answer", "contact us", "support", "help center", "cookie policy"
 ]
 
 FORBIDDEN_PATTERN = re.compile(r"\b(" + "|".join(re.escape(w) for w in SHARE_BLACKLIST) + r")\b")
@@ -32,6 +33,125 @@ CONSENT_TEXT_KEYS = [
     "terms", "privacy", "policy", "by continuing", "agree", "consent",
     "услов", "политик", "соглас"
 ]
+
+ACTION_KEYWORDS = [
+    "continue", "next", "submit", "verify", "confirm", "proceed", "get started",
+    "start", "show my results", "see my results", "i'm in", "i’m in", "go on",
+    "keep going", "done", "finish", "ok", "okay", "got it", "claim", "unlock",
+    "continuar", "siguiente", "verificar", "confirmar", "weiter", "suivant", "continuer",
+    "продолжить", "подтвердить", "отправить", "далее", "готово"
+]
+
+QUESTION_NEGATIVE_TERMS = [
+    "cookie", "cookies", "privacy", "settings", "preferences", "manage", "share",
+    "view more", "show less", "read more", "go to previous", "previous question",
+    "previous step", "back", "zurück", "назад", "app store", "google play", "download app",
+    "cookie policy", "contact us", "contact", "support", "help", "go back", "previous", "edit answer"
+]
+
+SELECT_ALL_KEYWORDS = [
+    "select all", "choose all", "all of the above", "seleccionar todo", "выбрать всё",
+    "выбрать все", "tout sélectionner", "alle auswählen"
+]
+
+
+def _js_interaction_helpers() -> str:
+    return r"""
+        const normalizeText = (...parts) => parts
+            .filter(Boolean)
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        const isElementVisible = (el) => {
+            if (!el || !el.isConnected) return false;
+            if (el.closest('[hidden], [aria-hidden="true"], inert')) return false;
+            const s = window.getComputedStyle(el);
+            if (!s) return false;
+            if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') return false;
+            if (parseFloat(s.opacity || '1') <= 0.02) return false;
+            if (s.pointerEvents === 'none') return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 6 || r.height < 6) return false;
+            if (r.right < 0 || r.bottom < 0 || r.left > window.innerWidth || r.top > window.innerHeight) return false;
+            return true;
+        };
+
+        const viewportRatio = (rect) => {
+            if (!rect) return 0;
+            const left = Math.max(0, rect.left);
+            const top = Math.max(0, rect.top);
+            const right = Math.min(window.innerWidth, rect.right);
+            const bottom = Math.min(window.innerHeight, rect.bottom);
+            const width = Math.max(0, right - left);
+            const height = Math.max(0, bottom - top);
+            const area = Math.max(1, rect.width * rect.height);
+            return (width * height) / area;
+        };
+
+        const getElementText = (el) => normalizeText(
+            el.innerText || '',
+            el.textContent || '',
+            el.value || '',
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            el.getAttribute('alt') || '',
+            el.getAttribute('placeholder') || ''
+        );
+
+        const isDisabledElement = (el) => {
+            if (!el) return true;
+            if (el.disabled || el.hasAttribute('disabled')) return true;
+            const ariaDisabled = normalizeText(el.getAttribute('aria-disabled') || '');
+            if (ariaDisabled === 'true') return true;
+            return false;
+        };
+
+        const isProbablyClickable = (el) => {
+            if (!el) return false;
+            const tag = (el.tagName || '').toLowerCase();
+            const role = normalizeText(el.getAttribute('role') || '');
+            const style = window.getComputedStyle(el);
+            return ['button', 'a', 'label', 'summary', 'option'].includes(tag)
+                || role === 'button'
+                || role === 'option'
+                || typeof el.onclick === 'function'
+                || el.hasAttribute('data-testid')
+                || el.hasAttribute('tabindex')
+                || style.cursor === 'pointer';
+        };
+
+        const isTopMostForClick = (el) => {
+            if (!isElementVisible(el)) return false;
+            const rect = el.getBoundingClientRect();
+            const points = [
+                [rect.left + rect.width / 2, rect.top + rect.height / 2],
+                [rect.left + Math.min(rect.width - 2, Math.max(2, rect.width * 0.25)), rect.top + Math.min(rect.height - 2, Math.max(2, rect.height * 0.25))],
+                [rect.right - Math.min(rect.width - 2, Math.max(2, rect.width * 0.25)), rect.bottom - Math.min(rect.height - 2, Math.max(2, rect.height * 0.25))]
+            ];
+            for (const [x, y] of points) {
+                if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
+                const topEl = document.elementFromPoint(x, y);
+                if (!topEl) continue;
+                if (topEl === el || el.contains(topEl) || topEl.contains(el)) return true;
+            }
+            return false;
+        };
+
+        const clickElementReliably = (el) => {
+            if (!el) return false;
+            try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) {}
+            try { el.focus({ preventScroll: true }); } catch (e) {}
+            try {
+                ['pointerdown','mousedown','mouseup','pointerup','click'].forEach(evt => {
+                    try { el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+                });
+            } catch (e) {}
+            try { el.click(); return true; } catch (e) {}
+            return false;
+        };
+    """
 
 
 def is_forbidden_button(el, log_func=None) -> bool:
@@ -765,7 +885,9 @@ def detect_page_stuck_state(page: Page, log_func) -> dict:
             if (hiddenContent) {
                 // Проверяем не является ли это ожидаемым состоянием
                 const expectedHidden = ['cookie', 'modal', 'popup', 'overlay'];
-                const hiddenClass = (hiddenContent.className || '').toLowerCase();
+                const hiddenClass = typeof hiddenContent.className === 'string'
+                    ? hiddenContent.className.toLowerCase()
+                    : String(hiddenContent.getAttribute('class') || '').toLowerCase();
                 if (!expectedHidden.some(h => hiddenClass.includes(h))) {
                     // Возможно контент должен быть виден
                     result.details.potentially_hidden = true;
@@ -1300,6 +1422,8 @@ def classify_screen(page: Page, log_func):
             return debug_return('info', "Game/Prize screen detected (keyword in buttons/URL)")
 
     # 4. Email
+    email_step_signals = ["/email", "step=email", "email-step", "auth-capture", "enter-email"]
+    name_step_signals = ["what's your name", "what is your name", "your name", "full name", "first name"]
     has_email_input = page.locator("input[type='email'], input[autocomplete*='email' i]").count() > 0
     if not has_email_input:
         inputs = page.locator("input:not([type='hidden'])")
@@ -1317,6 +1441,47 @@ def classify_screen(page: Page, log_func):
             pd_kws = ["age", "height", "weight", "name", "СЂРѕСЃС‚", "РІРµСЃ", "РІРѕР·СЂР°СЃС‚", "РёРјСЏ"]
             if not any(k in t for k in pd_kws):
                 has_email_input = True
+
+    if not has_email_input and page.locator(FILLABLE_INPUT_SELECTOR).count() == 1:
+        try:
+            only_input = page.locator(FILLABLE_INPUT_SELECTOR).first
+            input_hints = " ".join([
+                (only_input.get_attribute("placeholder") or ""),
+                (only_input.get_attribute("name") or ""),
+                (only_input.get_attribute("id") or ""),
+                (only_input.get_attribute("autocomplete") or ""),
+                (only_input.get_attribute("aria-label") or ""),
+                (only_input.get_attribute("data-testid") or ""),
+            ]).lower()
+            email_like_text = any(k in t for k in ["email", "e-mail", "enter your email", "your email", "work email"])
+            email_like_url = any(k in u for k in email_step_signals)
+            email_like_input = any(k in input_hints for k in ["email", "e-mail", "mail"])
+            name_like_text = any(k in t for k in name_step_signals)
+            name_like_input = any(k in input_hints for k in ["name", "full-name", "fullname", "first-name", "firstname"])
+            if (email_like_text or email_like_url or email_like_input) and not (name_like_text or name_like_input):
+                has_email_input = True
+        except:
+            pass
+
+    if has_email_input:
+        try:
+            visible_email_like = page.evaluate(
+                "() => {\n"
+                + _js_interaction_helpers()
+                + "const nodes = Array.from(document.querySelectorAll('input, textarea'));\n"
+                + "return nodes.some(el => {\n"
+                + "  if (!isElementVisible(el) || isDisabledElement(el)) return false;\n"
+                + "  const type = normalizeText(el.getAttribute('type') || '');\n"
+                + "  const hints = getElementText(el);\n"
+                + "  if (type === 'email') return true;\n"
+                + "  return ['email', 'e-mail', 'mail@'].some(k => hints.includes(k));\n"
+                + "});\n"
+                + "}"
+            )
+            if not visible_email_like:
+                has_email_input = False
+        except:
+            pass
 
     if has_email_input: return debug_return('email', "Email field found via attributes or text")
 
@@ -1412,33 +1577,50 @@ def classify_screen(page: Page, log_func):
 
 
 def find_continue_button(page: Page, log_func=None):
-    keywords = [
-        'Continue', 'Next', 'Get my plan', 'Start', 'Take the quiz', 
-        'Get started', 'Start quiz', 'Get my offer', 'Next step', 'Proceed', 
-        'Submit', 'Show my results', 'See my results', "Let's", "Do it", "I'm in",
-        'Got it', 'Got it!', "continuar", "siguiente", 'weiter', 'suivant', 'РїСЂРѕРґРѕР»Р¶РёС‚СЊ', 'РїРѕРЅСЏС‚СЊ', 'РїСЂРёРЅСЏС‚СЊ', 'РѕРє', 'РЅР°С‡Р°С‚СЊ'
-    ]
-    # Restrict to likely interactive elements to avoid picking up headlines/prompts
-    button_locator = page.locator(
-        "button:visible, [role='button']:visible, a.button:visible, a:visible, "
-        "input[type='submit']:visible, input[type='button']:visible"
-    )
-    
-    for text in keywords:
-        # We search within buttons/links for the text
-        btns = button_locator.get_by_text(text, exact=False)
-        if btns.count() > 0:
-            btn = btns.first
-            if btn.is_visible(timeout=500):
-                try:
-                    if not btn.is_enabled():
-                        continue
-                except:
-                    pass
-                if not is_forbidden_button(btn, log_func): return btn
-
-    # We purposefully do not fallback to random buttons here, as it causes 
-    # the bot to mistakenly click choice variants as 'Next' buttons.
+    try:
+        page.evaluate("""() => document.querySelectorAll('[data-qfr-continue-best]').forEach(el => el.removeAttribute('data-qfr-continue-best'))""")
+        script = (
+            "() => {\n"
+            + _js_interaction_helpers()
+            + f"const positive = {json.dumps([k.lower() for k in ACTION_KEYWORDS])};\n"
+            + f"const negative = {json.dumps(QUESTION_NEGATIVE_TERMS)};\n"
+            + "const nodes = Array.from(document.querySelectorAll(\"button, [role='button'], a, input[type='submit'], input[type='button'], div, span\"));\n"
+            + "let best = null; let bestScore = -1;\n"
+            + "for (const el of nodes) {\n"
+            + "  if (!isElementVisible(el) || !isProbablyClickable(el) || isDisabledElement(el)) continue;\n"
+            + "  const text = getElementText(el);\n"
+            + "  if (!text || text.length > 180) continue;\n"
+            + "  if (negative.some(term => text.includes(term))) continue;\n"
+            + "  if (!positive.some(term => text.includes(term))) continue;\n"
+            + "  const rect = el.getBoundingClientRect();\n"
+            + "  const style = window.getComputedStyle(el);\n"
+            + "  let score = 70;\n"
+            + "  if ((el.tagName || '').toLowerCase() === 'button') score += 20;\n"
+            + "  if (normalizeText(el.getAttribute('role') || '') === 'button') score += 15;\n"
+            + "  if ((el.tagName || '').toLowerCase() === 'input') score += 14;\n"
+            + "  if (style.cursor === 'pointer') score += 8;\n"
+            + "  if (viewportRatio(rect) >= 0.95) score += 18; else if (viewportRatio(rect) >= 0.6) score += 10;\n"
+            + "  if (isTopMostForClick(el)) score += 30; else score -= 60;\n"
+            + "  if (rect.top >= 0 && rect.bottom <= window.innerHeight) score += 10;\n"
+            + "  if (text === 'continue' || text === 'next' || text === 'submit' || text === 'continuar') score += 12;\n"
+            + "  if (text.includes('verify') || text.includes('confirm')) score += 12;\n"
+            + "  if (text.includes('get started') || text.includes('start')) score += 8;\n"
+            + "  if ((el.closest('form') || null)) score += 6;\n"
+            + "  if (rect.width >= 44 && rect.height >= 32) score += 6;\n"
+            + "  if (rect.width < 24 || rect.height < 24) score -= 40;\n"
+            + "  if (score > bestScore) { bestScore = score; best = el; }\n"
+            + "}\n"
+            + "if (!best) return false;\n"
+            + "best.setAttribute('data-qfr-continue-best', '1');\n"
+            + "return true;\n"
+            + "}"
+        )
+        if page.evaluate(script):
+            btn = page.locator("[data-qfr-continue-best='1']").first
+            if btn.count() > 0 and not is_forbidden_button(btn, log_func):
+                return btn
+    except:
+        pass
     return None
 
 
@@ -1448,72 +1630,37 @@ def try_click_continue_js(page: Page, log_func) -> bool:
     Полезно для кастомных div-кнопок (React/Next), где нет <button>.
     """
     try:
-        result = page.evaluate(r"""() => {
-            const positive = [
-                'continue','next','proceed','submit','start','get started','get my',
-                'show results','see results','go on','keep going','continue quiz',
-                'continuar','continuar >','weiter','suivant','продолжить'
-            ];
-            const negative = [
-                'cookie','privacy','settings','preferences','manage','share','back','zurück','назад'
-            ];
-
-            const isVisible = (el) => {
-                if (!el) return false;
-                const s = window.getComputedStyle(el);
-                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
-                const r = el.getBoundingClientRect();
-                return r.width > 8 && r.height > 8 && r.bottom > 0 && r.right > 0;
-            };
-
-            const isDisabled = (el) => {
-                const aria = (el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
-                const dis = !!el.disabled || el.hasAttribute('disabled');
-                return aria || dis;
-            };
-
-            const candidates = Array.from(document.querySelectorAll(
-                "button, [role='button'], a, input[type='submit'], input[type='button'], div, span"
-            ));
-
-            let best = null;
-            let bestScore = -1;
-            for (const el of candidates) {
-                if (!isVisible(el) || isDisabled(el)) continue;
-
-                const txt = ((el.innerText || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase());
-                if (!txt || txt.length > 120) continue;
-                if (negative.some(k => txt.includes(k))) continue;
-                if (!positive.some(k => txt.includes(k))) continue;
-
-                const st = window.getComputedStyle(el);
-                const r = el.getBoundingClientRect();
-                let score = 0;
-
-                score += 50;
-                if (el.tagName === 'BUTTON') score += 20;
-                if (el.getAttribute('role') === 'button') score += 12;
-                if (st.cursor === 'pointer') score += 10;
-                if (r.top > window.innerHeight * 0.45) score += 10; // CTA чаще внизу экрана
-                if (txt === 'continue' || txt === 'next' || txt === 'continuar') score += 8;
-
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = { el, txt };
-                }
-            }
-
-            if (!best) return { clicked: false, text: null };
-
-            const el = best.el;
-            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-            ['pointerdown','mousedown','mouseup','pointerup','click'].forEach(evt => {
-                try { el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
-            });
-            try { el.click(); } catch (e) {}
-            return { clicked: true, text: best.txt || null };
-        }""")
-
+        script = (
+            "() => {\n"
+            + _js_interaction_helpers()
+            + f"const positive = {json.dumps([k.lower() for k in ACTION_KEYWORDS])};\n"
+            + f"const negative = {json.dumps(QUESTION_NEGATIVE_TERMS)};\n"
+            + "const candidates = Array.from(document.querySelectorAll(\"button, [role='button'], a, input[type='submit'], input[type='button'], div, span\"));\n"
+            + "let best = null; let bestScore = -1;\n"
+            + "for (const el of candidates) {\n"
+            + "  if (!isElementVisible(el) || isDisabledElement(el) || !isProbablyClickable(el)) continue;\n"
+            + "  const txt = getElementText(el);\n"
+            + "  if (!txt || txt.length > 180) continue;\n"
+            + "  if (negative.some(k => txt.includes(k))) continue;\n"
+            + "  if (!positive.some(k => txt.includes(k))) continue;\n"
+            + "  const st = window.getComputedStyle(el);\n"
+            + "  const r = el.getBoundingClientRect();\n"
+            + "  let score = 60;\n"
+            + "  if ((el.tagName || '').toLowerCase() === 'button') score += 22;\n"
+            + "  if (normalizeText(el.getAttribute('role') || '') === 'button') score += 15;\n"
+            + "  if (st.cursor === 'pointer') score += 8;\n"
+            + "  if (viewportRatio(r) >= 0.95) score += 20;\n"
+            + "  if (isTopMostForClick(el)) score += 25; else score -= 60;\n"
+            + "  if (r.top > window.innerHeight * 0.45) score += 10;\n"
+            + "  if (txt === 'continue' || txt === 'next' || txt === 'continuar') score += 10;\n"
+            + "  if ((el.closest('form') || null)) score += 6;\n"
+            + "  if (score > bestScore) { bestScore = score; best = { el, txt }; }\n"
+            + "}\n"
+            + "if (!best) return { clicked: false, text: null };\n"
+            + "return { clicked: clickElementReliably(best.el), text: best.txt || null };\n"
+            + "}"
+        )
+        result = page.evaluate(script)
         if result and result.get("clicked"):
             log_func(f"JS CTA fallback: клик по кнопке '{(result.get('text') or '').strip()[:50]}'")
             return True
@@ -1529,110 +1676,61 @@ def try_click_question_option_js(page: Page, log_func, repeat_attempt: int = 0, 
     без текста (например, иконки/числовые value/карточки со SVG).
     """
     try:
-        result = page.evaluate(r"""(params) => {
-            const repeatAttempt = params.repeatAttempt || 0;
-            const preferSkip = !!params.preferSkip;
-            const negative = [
-                'cookie','cookies','privacy','settings','preferences','manage','share',
-                'view more','show less','read more','back','zurück','назад',
-                'continue','next','start','submit','got it','let\'s do it','let’s do it'
-            ];
-            const skipTexts = [
-                'skip this question', 'skip question', 'skip this step', 'skip step',
-                'skip for now', 'skip', 'not sure yet', 'decide later'
-            ];
-
-            const isVisible = (el) => {
-                if (!el) return false;
-                const s = window.getComputedStyle(el);
-                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
-                const r = el.getBoundingClientRect();
-                return r.width > 18 && r.height > 18 && r.bottom > 0 && r.right > 0;
-            };
-
-            const isDisabled = (el) => {
-                const aria = (el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
-                const dis = !!el.disabled || el.hasAttribute('disabled');
-                return aria || dis;
-            };
-
-            const clickable = (el) => {
-                const t = (el.tagName || '').toLowerCase();
-                const role = (el.getAttribute('role') || '').toLowerCase();
-                const s = window.getComputedStyle(el);
-                return t === 'button' || t === 'label' || t === 'input' || t === 'a' || role === 'button' || typeof el.onclick === 'function' || s.cursor === 'pointer';
-            };
-
-            const getText = (el) => {
-                const txt = (el.innerText || '').trim();
-                const aria = (el.getAttribute('aria-label') || '').trim();
-                const value = (el.getAttribute('value') || '').trim();
-                const alt = (el.getAttribute('alt') || '').trim();
-                return [txt, aria, value, alt].filter(Boolean).join(' ').trim();
-            };
-
-            const candidates = Array.from(document.querySelectorAll(
-                "button, [role='button'], label, [data-testid], [class], li, div"
-            ));
-
-            const scored = [];
-            for (let i = 0; i < candidates.length; i++) {
-                const el = candidates[i];
-                if (!isVisible(el) || isDisabled(el) || !clickable(el)) continue;
-
-                const rect = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                const text = getText(el);
-                const full = `${text} ${(el.className || '')} ${(el.getAttribute('data-testid') || '')}`.toLowerCase();
-                const isSkip = skipTexts.some(k => full.includes(k));
-                if (negative.some(k => full.includes(k)) && !(preferSkip && isSkip)) continue;
-
-                let score = 0;
-                const tag = (el.tagName || '').toLowerCase();
-                if (preferSkip && isSkip) score += 200;
-                if (tag === 'button') score += 25;
-                if ((el.getAttribute('role') || '').toLowerCase() === 'button') score += 15;
-                if (/(answer|option|choice|item|card|select)/i.test(full)) score += 40;
-                if (/^\d+(\.\d+)?$/.test((el.getAttribute('value') || '').trim())) score += 30;
-                if (el.querySelector('svg, img, canvas, path')) score += 18;
-                if (!text || text.length <= 40) score += 10;
-                if (rect.width >= 36 && rect.height >= 36) score += 10;
-                if (style.position !== 'fixed' && style.position !== 'sticky') score += 10;
-                if (rect.top > 40 && rect.bottom < window.innerHeight - 40) score += 8;
-                if (preferSkip && isSkip && rect.top > window.innerHeight * 0.55) score += 25;
-
-                const parent = el.parentElement;
-                if (parent) {
-                    const siblings = Array.from(parent.children).filter(sib => sib !== el && isVisible(sib));
-                    if (siblings.length >= 2) score += 8;
-                }
-
-                if (score < 20) continue;
-                scored.push({ index: i, score, text: text || (el.getAttribute('value') || '').trim() || '<icon-option>' });
-            }
-
-            if (!scored.length) return { clicked: false, text: null, count: 0 };
-
-            scored.sort((a, b) => b.score - a.score || a.index - b.index);
-            const unique = [];
-            const seen = new Set();
-            for (const item of scored) {
-                const key = `${item.text}::${item.index}`;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                unique.push(item);
-            }
-
-            const pick = unique[Math.min(repeatAttempt, unique.length - 1)];
-            const el = candidates[pick.index];
-            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
-            ['pointerdown','mousedown','mouseup','pointerup','click'].forEach(evt => {
-                try { el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
-            });
-            try { el.click(); } catch (e) {}
-            return { clicked: true, text: pick.text || null, count: unique.length };
-        }""", {"repeatAttempt": repeat_attempt, "preferSkip": prefer_skip})
-
+        negatives = QUESTION_NEGATIVE_TERMS + ['continue', 'next', 'start', 'submit', 'got it', "let's do it", 'let’s do it', 'contact us']
+        script = (
+            "(params) => {\n"
+            + _js_interaction_helpers()
+            + f"const negative = {json.dumps(negatives)};\n"
+            + "const repeatAttempt = params.repeatAttempt || 0;\n"
+            + "const preferSkip = !!params.preferSkip;\n"
+            + "const skipTexts = ['skip this question', 'skip question', 'skip this step', 'skip step', 'skip for now', 'skip', 'not sure yet', 'decide later'];\n"
+            + "const candidates = Array.from(document.querySelectorAll(\"button, [role='button'], label, [data-testid], [class], li, div\"));\n"
+            + "const scored = [];\n"
+            + "for (let i = 0; i < candidates.length; i++) {\n"
+            + "  const el = candidates[i];\n"
+            + "  if (!isElementVisible(el) || isDisabledElement(el) || !isProbablyClickable(el)) continue;\n"
+            + "  const rect = el.getBoundingClientRect();\n"
+            + "  const style = window.getComputedStyle(el);\n"
+            + "  const text = getElementText(el);\n"
+            + "  const full = `${text} ${normalizeText(el.className || '')} ${normalizeText(el.getAttribute('data-testid') || '')}`.toLowerCase();\n"
+            + "  const isSkip = skipTexts.some(k => full.includes(k));\n"
+            + "  if (negative.some(k => full.includes(k)) && !(preferSkip && isSkip)) continue;\n"
+            + "  let score = 0;\n"
+            + "  const tag = (el.tagName || '').toLowerCase();\n"
+            + "  if (preferSkip && isSkip) score += 200;\n"
+            + "  if (tag === 'button') score += 25;\n"
+            + "  if ((el.getAttribute('role') || '').toLowerCase() === 'button') score += 15;\n"
+            + "  if (/(answer|option|choice|item|card|select)/i.test(full)) score += 40;\n"
+            + "  if (/^\\d+(\\.\\d+)?$/.test((el.getAttribute('value') || '').trim())) score += 30;\n"
+            + "  if (el.querySelector('svg, img, canvas, path')) score += 18;\n"
+            + "  if (!text || text.length <= 40) score += 10;\n"
+            + "  if (rect.width >= 36 && rect.height >= 36) score += 10;\n"
+            + "  if (style.position !== 'fixed' && style.position !== 'sticky') score += 10;\n"
+            + "  if (rect.top > 40 && rect.bottom < window.innerHeight - 20) score += 8;\n"
+            + "  if (preferSkip && isSkip && rect.top > window.innerHeight * 0.55) score += 25;\n"
+            + "  if (viewportRatio(rect) >= 0.95) score += 18; else if (viewportRatio(rect) >= 0.6) score += 8;\n"
+            + "  if (isTopMostForClick(el)) score += 28; else score -= 70;\n"
+            + "  if (/(continue|next|submit|start|get started|contact us|support|help|cookie policy)/i.test(text)) score -= 90;\n"
+            + "  if (/go to previous|previous question|previous step|back|go back|edit answer/i.test(text)) score -= 180;\n"
+            + "  if (rect.top < 90 && rect.left < 90 && rect.width <= 90 && rect.height <= 90) score -= 180;\n"
+            + "  if (el.closest('header')) score -= 220;\n"
+            + f"  if ({json.dumps(SELECT_ALL_KEYWORDS)}.some(term => text.includes(term))) score += 120;\n"
+            + "  if (text.length > 120) score -= 20;\n"
+            + "  const parent = el.parentElement;\n"
+            + "  if (parent) { const siblings = Array.from(parent.children).filter(sib => sib !== el && isElementVisible(sib)); if (siblings.length >= 2) score += 8; }\n"
+            + "  if (score < 25) continue;\n"
+            + "  scored.push({ index: i, score, text: text || (el.getAttribute('value') || '').trim() || '<icon-option>' });\n"
+            + "}\n"
+            + "if (!scored.length) return { clicked: false, text: null, count: 0 };\n"
+            + "scored.sort((a, b) => b.score - a.score || a.index - b.index);\n"
+            + "const unique = []; const seen = new Set();\n"
+            + "for (const item of scored) { const key = `${item.text}::${item.index}`; if (seen.has(key)) continue; seen.add(key); unique.push(item); }\n"
+            + "const pick = unique[Math.min(repeatAttempt, unique.length - 1)];\n"
+            + "const el = candidates[pick.index];\n"
+            + "return { clicked: clickElementReliably(el), text: pick.text || null, count: unique.length };\n"
+            + "}"
+        )
+        result = page.evaluate(script, {"repeatAttempt": repeat_attempt, "preferSkip": prefer_skip})
         if result and result.get("clicked"):
             log_func(
                 f"JS option fallback: клик по варианту '{(result.get('text') or '').strip()[:50]}' "
@@ -1874,7 +1972,25 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 placeholder = (inp.get_attribute("placeholder") or "").lower()
                 
                 val = fill_values.get("name", "John")
-                if screen_type == 'email' or any(k in placeholder for k in ["email", "e-mail"]):
+                input_hints = " ".join([
+                    placeholder,
+                    (inp.get_attribute("name") or "").lower(),
+                    (inp.get_attribute("id") or "").lower(),
+                    (inp.get_attribute("autocomplete") or "").lower(),
+                    (inp.get_attribute("aria-label") or "").lower(),
+                ])
+                is_name_field = any(k in input_hints for k in ["name", "full-name", "fullname", "first-name", "firstname"]) or any(
+                    k in page.evaluate("() => document.body.innerText.toLowerCase()") for k in ["what's your name", "what is your name", "your name", "full name", "first name"]
+                )
+                is_email_field = (
+                    screen_type == 'email'
+                    or itype == "email"
+                    or any(k in input_hints for k in ["email", "e-mail", "mail"])
+                    or (("/email" in page.url.lower() or "step=email" in page.url.lower()) and inputs_count == 1)
+                )
+                if is_name_field:
+                    is_email_field = False
+                if is_email_field:
                     email_tpl = fill_values.get("email", "testuser{ts}@gmail.com")
                     val = email_tpl.replace("{ts}", str(int(time.time())))
                 
@@ -1897,7 +2013,7 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 
                 if is_date_field:
                     val = fill_values.get("date_of_birth", "01/01/1990")
-                elif is_numeric:
+                elif is_numeric and not is_email_field:
                     if any(k in placeholder or k in context_url or k in context_text for k in ["height", "СЂРѕСЃС‚"]):
                         val = fill_values.get("height", "170")
                     elif any(k in placeholder or k in context_url or k in context_text for k in ["goal", "С†РµР»СЊ"]):
@@ -1933,6 +2049,7 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                     except Exception:
                         log_func(f"Ошибка заполнения: {str(e)[:80]}")
 
+            time.sleep(0.4)
             btn = find_continue_button(page, log_func)
             if btn:
                 btn_txt = " ".join(safe_inner_text(btn, "").split())
@@ -1943,6 +2060,22 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 except:
                     page.keyboard.press("Enter")
             else: page.keyboard.press("Enter")
+            time.sleep(0.6)
+            if screen_type == 'email' and page.url == start_url and get_screen_hash(page) == start_hash:
+                btn_retry = find_continue_button(page, log_func)
+                if btn_retry:
+                    retry_txt = " ".join(safe_inner_text(btn_retry, "").split())
+                    log_func(f"Повторный submit email после рендера CTA: {retry_txt}")
+                    try:
+                        btn_retry.click(force=True, timeout=2000)
+                    except:
+                        pass
+                else:
+                    try:
+                        page.keyboard.press("Tab")
+                        page.keyboard.press("Enter")
+                    except:
+                        pass
             log_func("Форма отправлена. Ожидание перехода...")
             wait_for_transition(page, start_url, start_hash, timeout=12.0)
             return "input_submitted"
@@ -2037,6 +2170,9 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                             pass
                     txt = safe_inner_text(curr, "")
                     if txt and not re.search(r'^\d+\s*/\s*\d+$', txt) and len(txt) < 100 and not is_nav_button(txt):
+                        txt_l = txt.lower()
+                        if any(term in txt_l for term in QUESTION_NEGATIVE_TERMS):
+                            continue
                         text_targets.append(curr)
 
             if screen_type == 'question' and is_calendar_question(page) and has_skip_question_control(page):
@@ -2105,6 +2241,11 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                         log_func(f"Повтор шага: все элементы одинаковые, пробую #{chosen_idx + 1}")
                 else:
                     chosen_idx = 0
+                    for idx, candidate_el in enumerate(target_pool):
+                        candidate_text = safe_inner_text(candidate_el, "").lower()
+                        if any(term in candidate_text for term in SELECT_ALL_KEYWORDS):
+                            chosen_idx = idx
+                            break
                     target = target_pool[chosen_idx]
 
             if not target:
@@ -2173,6 +2314,7 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
             start_ui = get_ui_step(page)
             # 1. Click choice
             clean_target_text = " ".join(safe_inner_text(target, "").split())
+            target_is_select_all = any(term in clean_target_text.lower() for term in SELECT_ALL_KEYWORDS)
             display_text = clean_target_text[:50] if clean_target_text else "<No text>"
             log_func(f"Нажатие выбора: {display_text}")
             try:
@@ -2232,7 +2374,8 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
             # 2. Wait for Next button if no auto-advance
             start_time = time.time()
             clicked_continue = False
-            while time.time() - start_time < 3.0:
+            wait_budget = 4.5 if target_is_select_all else 3.0
+            while time.time() - start_time < wait_budget:
                 curr_ui = get_ui_step(page)
                 if curr_ui != start_ui and curr_ui != "unknown":
                     break

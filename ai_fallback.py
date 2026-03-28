@@ -29,7 +29,8 @@ if load_dotenv is not None:
 SAFE_FORBIDDEN_TERMS = [
     "cookie", "cookies", "privacy settings", "cookie settings", "datenschutzeinstellungen",
     "share", "sharing", "tell a friend", "invite", "recommend", "view more", "show less",
-    "read more", "app store", "google play", "download app"
+    "read more", "app store", "google play", "download app", "contact us", "support",
+    "help center", "cookie policy", "go back", "previous", "edit answer"
 ]
 
 HIGH_RISK_TERMS = [
@@ -47,6 +48,12 @@ INPUT_HINT_MAP = {
     "date_of_birth": ["date of birth", "birthday", "birth", "dob"],
     "default_number": ["number", "amount"],
 }
+
+POST_INPUT_SUBMIT_KEYWORDS = [
+    "continue", "next", "submit", "verify", "confirm", "get started", "get my",
+    "show my results", "see my results", "i'm in", "i’m in", "proceed",
+    "continuar", "siguiente", "weiter", "suivant", "продолжить", "подтвердить"
+]
 
 
 @dataclass
@@ -189,13 +196,27 @@ def _mark_candidate_risk(candidate: Dict[str, Any], current_url: str) -> Dict[st
 
 def collect_actionable_elements(page: Page, fill_values: Dict[str, str], max_candidates: int = 80) -> List[AICandidate]:
     raw_candidates = page.evaluate(
-        """() => {
+        r"""() => {
+        const normalizeText = (...parts) => parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
         const isVisible = (el) => {
-            if (!el) return false;
+            if (!el || !el.isConnected) return false;
+            if (el.closest('[hidden], [aria-hidden="true"], inert')) return false;
             const s = window.getComputedStyle(el);
-            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+            if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') return false;
+            if (parseFloat(s.opacity || '1') <= 0.02) return false;
+            if (s.pointerEvents === 'none') return false;
             const r = el.getBoundingClientRect();
-            return r.width > 8 && r.height > 8 && r.bottom > 0 && r.right > 0;
+            return r.width > 8 && r.height > 8 && r.bottom > 0 && r.right > 0 && r.left < window.innerWidth && r.top < window.innerHeight;
+        };
+        const viewportRatio = (rect) => {
+            const left = Math.max(0, rect.left);
+            const top = Math.max(0, rect.top);
+            const right = Math.min(window.innerWidth, rect.right);
+            const bottom = Math.min(window.innerHeight, rect.bottom);
+            const width = Math.max(0, right - left);
+            const height = Math.max(0, bottom - top);
+            const area = Math.max(1, rect.width * rect.height);
+            return (width * height) / area;
         };
         const isEditableInput = (el) => {
             const tag = (el.tagName || '').toLowerCase();
@@ -238,6 +259,11 @@ def collect_actionable_elements(page: Page, fill_values: Dict[str, str], max_can
             const clickable = isClickable(el);
             if (!visible || (!inputLike && !clickable)) continue;
             const rect = el.getBoundingClientRect();
+            const topEl = document.elementFromPoint(
+                Math.min(window.innerWidth - 1, Math.max(0, rect.left + rect.width / 2)),
+                Math.min(window.innerHeight - 1, Math.max(0, rect.top + rect.height / 2))
+            );
+            const unobstructed = !topEl || topEl === el || el.contains(topEl) || topEl.contains(el);
             const tag = (el.tagName || '').toLowerCase();
             const inputType = (el.getAttribute('type') || '').toLowerCase();
             const enabled = !el.disabled && (el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
@@ -264,7 +290,9 @@ def collect_actionable_elements(page: Page, fill_values: Dict[str, str], max_can
                     x: Math.round(rect.x),
                     y: Math.round(rect.y),
                     width: Math.round(rect.width),
-                    height: Math.round(rect.height)
+                    height: Math.round(rect.height),
+                    viewport_ratio: Number(viewportRatio(rect).toFixed(3)),
+                    unobstructed: !!unobstructed
                 }
             });
             seq += 1;
@@ -454,6 +482,15 @@ def validate_ai_decision(context: AIFallbackContext, decision: AIDecision, setti
         return {"ok": False, "reason": "forbidden_candidate", "candidate": candidate}
     if not candidate.visible or not candidate.enabled:
         return {"ok": False, "reason": "candidate_not_interactable", "candidate": candidate}
+    try:
+        viewport_ratio = float((candidate.bounding_box or {}).get("viewport_ratio", 0.0))
+    except Exception:
+        viewport_ratio = 0.0
+    unobstructed = bool((candidate.bounding_box or {}).get("unobstructed", False))
+    if viewport_ratio <= 0.15:
+        return {"ok": False, "reason": "candidate_out_of_viewport", "candidate": candidate}
+    if not unobstructed:
+        return {"ok": False, "reason": "candidate_obstructed", "candidate": candidate}
     if decision.action == "click":
         if candidate.kind != "clickable":
             return {"ok": False, "reason": "click_on_non_clickable_candidate", "candidate": candidate}
@@ -488,7 +525,11 @@ def execute_ai_decision(page: Page, decision: AIDecision, validation: Dict[str, 
         locator = page.locator(candidate.selector).first
     if locator.count() == 0:
         return {"executed": False, "effect": "locator_not_found", "element_id": candidate.element_id}
-    locator.scroll_into_view_if_needed(timeout=2000)
+    try:
+        locator.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        if decision.action == "click":
+            return {"executed": False, "effect": "candidate_not_visible_after_scroll", "element_id": candidate.element_id}
     if decision.action == "click":
         locator.click(force=True, timeout=2500)
         log_func(f"AI fallback: клик по {candidate.element_id} | text={candidate.text[:60]}")
@@ -502,6 +543,36 @@ def execute_ai_decision(page: Page, decision: AIDecision, validation: Dict[str, 
             locator.press("Control+A")
             locator.type(text, delay=20)
         log_func(f"AI fallback: ввод в {candidate.element_id} | text={text[:60]}")
+        combined = _normalize_text(candidate.text, candidate.aria_label, candidate.placeholder, candidate.name, candidate.input_type, page.url)
+        should_submit = (
+            candidate.input_type == "email"
+            or any(term in combined for term in ["email", "e-mail", "/email", "step=email", "mail"])
+        )
+        if should_submit:
+            try:
+                cta = page.locator("button:visible, [role='button']:visible, a:visible, input[type='submit']:visible, input[type='button']:visible").first
+                cta_count = page.locator("button:visible, [role='button']:visible, a:visible, input[type='submit']:visible, input[type='button']:visible").count()
+                clicked = False
+                for idx in range(cta_count):
+                    curr = page.locator("button:visible, [role='button']:visible, a:visible, input[type='submit']:visible, input[type='button']:visible").nth(idx)
+                    try:
+                        txt = _normalize_text(curr.inner_text(), curr.get_attribute("aria-label") or "", curr.get_attribute("value") or "")
+                    except Exception:
+                        txt = ""
+                    if txt and any(k in txt for k in POST_INPUT_SUBMIT_KEYWORDS):
+                        curr.click(force=True, timeout=2000)
+                        log_func(f"AI fallback: post-input submit | text={txt[:60]}")
+                        clicked = True
+                        break
+                if not clicked:
+                    locator.press("Enter")
+                    log_func("AI fallback: post-input submit | key=Enter")
+            except Exception:
+                try:
+                    locator.press("Enter")
+                    log_func("AI fallback: post-input submit | key=Enter")
+                except Exception:
+                    pass
         return {"executed": True, "effect": "input", "element_id": candidate.element_id, "input_text": text}
     return {"executed": False, "effect": "unsupported_action", "element_id": candidate.element_id}
 
