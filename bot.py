@@ -595,9 +595,13 @@ def is_valid_url(url: str) -> bool:
 def check_user_access(user_id: int) -> bool:
     """Проверка доступа пользователя"""
     cfg = get_config()
+    if user_id in cfg.bot.admin_ids:
+        return True
+
     if cfg.bot.use_only_admin:
-        return user_id in cfg.bot.admin_ids
-    return user_id in cfg.bot.allowed_users or user_id in cfg.bot.admin_ids
+        return False
+
+    return True
 
 
 async def get_task_status_text(task: FunnelTask) -> str:

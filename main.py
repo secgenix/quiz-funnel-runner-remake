@@ -796,24 +796,28 @@ PAYWALL_URL_KEYWORDS = [
     "pricing",
     "subscription",
     "subscribe",
-    "plan",
     "plans",
     "premium",
     "membership",
     "checkout",
     "billing",
     "purchase",
-    "order",
+    "upgrade",
+    "trial",
 ]
 
 PAYWALL_PLAN_KEYWORDS = [
     "pricing",
-    "plan",
     "plans",
     "subscription",
     "subscribe",
     "premium",
     "membership",
+    "membership plan",
+    "subscription plan",
+    "choose your plan",
+    "select your plan",
+    "upgrade plan",
     "monthly",
     "annual",
     "yearly",
@@ -825,6 +829,9 @@ PAYWALL_PLAN_KEYWORDS = [
     "best value",
     "most popular",
     "unlimited access",
+    "premium access",
+    "premium membership",
+    "premium plan",
 ]
 
 PAYWALL_CTA_KEYWORDS = [
@@ -837,12 +844,16 @@ PAYWALL_CTA_KEYWORDS = [
     "select plan",
     "view plans",
     "upgrade now",
+    "upgrade to premium",
     "get premium",
     "buy now",
     "purchase",
     "checkout",
     "unlock now",
     "get access",
+    "continue to checkout",
+    "start subscription",
+    "start membership",
 ]
 
 PAYWALL_LIMITATION_KEYWORDS = [
@@ -859,6 +870,11 @@ PAYWALL_LIMITATION_KEYWORDS = [
     "full access",
     "buy access",
     "unlock your plan",
+    "unlock premium results",
+    "upgrade to continue",
+    "available on premium",
+    "premium only",
+    "members only",
 ]
 
 PAYWALL_TRIAL_KEYWORDS = [
@@ -882,11 +898,184 @@ PAYWALL_COMPARISON_KEYWORDS = [
     "features included",
     "choose the plan",
     "select the plan",
+    "most popular",
+    "best deal",
+    "best value",
+    "save ",
+]
+
+PAYWALL_BILLING_KEYWORDS = [
+    "billed",
+    "billing",
+    "renews",
+    "auto-renew",
+    "recurring",
+    "charged",
+    "payment method",
+    "credit card",
+    "card details",
+    "secure checkout",
+    "order summary",
+    "purchase summary",
+    "cancel anytime",
+    "after trial",
+    "today only",
+]
+
+PAYWALL_ACCESS_KEYWORDS = [
+    "unlock access",
+    "unlock premium",
+    "full access",
+    "premium access",
+    "members area",
+    "subscriber-only",
+    "subscription required",
+    "continue with subscription",
+    "upgrade to continue",
+    "access all content",
+]
+
+PAYWALL_NEGATIVE_KEYWORDS = [
+    "income",
+    "revenue",
+    "salary",
+    "earnings",
+    "profit",
+    "make money",
+    "how much do you earn",
+    "how much can you earn",
+    "quiz",
+    "survey",
+    "question",
+    "step",
+    "application",
+    "apply now",
+    "qualify",
+    "qualification",
+    "lead",
+    "lead form",
+    "results quiz",
+    "calculator",
+    "estimate",
+    "assessment",
+    "booking",
+    "appointment",
+    "consultation",
+    "quote",
+    "your budget",
+    "your income",
+    "monthly income",
+    "annual income",
+    "desired salary",
+]
+
+PAYWALL_CARD_BADGE_KEYWORDS = [
+    "most popular",
+    "best value",
+    "best deal",
+    "recommended",
+    "limited offer",
+    "save ",
+    "off",
+]
+
+PAYWALL_CHECKOUT_KEYWORDS = [
+    "checkout",
+    "secure checkout",
+    "payment method",
+    "card details",
+    "order summary",
+    "purchase summary",
+    "complete purchase",
+    "confirm purchase",
+    "confirm subscription",
 ]
 
 PAYWALL_PRICE_PATTERN = re.compile(
     r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))"
 )
+
+PAYWALL_PRICE_CONTEXT_PATTERN = re.compile(
+    r"(?:"
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))"
+    r"[^\n]{0,40}(?:/\s*(?:week|month|year)|per\s+(?:week|month|year)|monthly|yearly|weekly|billed|billing|trial|plan|subscription|membership)"
+    r"|"
+    r"(?:plan|subscription|membership|premium|trial|billing|billed|checkout|upgrade|subscribe)"
+    r"[^\n]{0,40}(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))"
+    r")"
+)
+
+PAYWALL_PERIODIC_PRICE_PATTERN = re.compile(
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))\s*(?:/\s*(?:week|month|year)|per\s+(?:week|month|year))"
+)
+
+PAYWALL_RANGE_PRICE_PATTERN = re.compile(
+    r"\b\d{1,4}\s*(?:-|–|to)\s*\d{1,4}\s*(?:k|m|тыс\.?|тысяч)?\s*(?:[$€£₽]|usd|eur|gbp|rub)?\b"
+)
+
+PAYWALL_PLAN_DURATION_PATTERN = re.compile(
+    r"\b\d{1,2}\s*[- ]?(?:day|week|month|year)s?\s+plan\b|\b(?:weekly|monthly|yearly|annual)\s+plan\b"
+)
+
+PAYWALL_DISCOUNT_PATTERN = re.compile(
+    r"\b(?:save|off)\s*\d{1,3}%\b|\b\d{1,3}%\s*off\b"
+)
+
+PAYWALL_MULTI_PRICE_CLUSTER_PATTERN = re.compile(
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))(?:[^\n]{0,24}(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))){1,}"
+)
+
+
+def _keyword_hits(text: str, keywords: list[str]) -> list[str]:
+    return [keyword for keyword in keywords if keyword in text]
+
+
+def _count_plan_option_titles(text: str) -> int:
+    option_groups = [
+        ["basic", "pro", "premium"],
+        ["monthly", "annual", "yearly"],
+        ["starter", "pro", "enterprise"],
+    ]
+    best = 0
+    for group in option_groups:
+        hits = sum(1 for item in group if item in text)
+        best = max(best, hits)
+    return best
+
+
+def _has_multiple_prices(text: str) -> bool:
+    prices = PAYWALL_PRICE_PATTERN.findall(text)
+    unique_prices = {price.strip() for price in prices if str(price).strip()}
+    return len(unique_prices) >= 2
+
+
+def _has_price_in_paywall_context(text: str) -> bool:
+    return bool(PAYWALL_PRICE_CONTEXT_PATTERN.search(text) or PAYWALL_PERIODIC_PRICE_PATTERN.search(text))
+
+
+def _has_quiz_money_context(text: str) -> bool:
+    if not PAYWALL_PRICE_PATTERN.search(text):
+        return False
+    if PAYWALL_RANGE_PRICE_PATTERN.search(text):
+        return True
+    negative_hits = _keyword_hits(text, PAYWALL_NEGATIVE_KEYWORDS)
+    money_hits = _keyword_hits(text, ["income", "revenue", "salary", "earnings", "profit", "budget"])
+    return len(negative_hits) >= 2 or bool(money_hits)
+
+
+def _count_commercial_price_signals(text: str) -> int:
+    score = 0
+    if PAYWALL_PERIODIC_PRICE_PATTERN.search(text):
+        score += 2
+    if PAYWALL_PLAN_DURATION_PATTERN.search(text):
+        score += 2
+    if PAYWALL_DISCOUNT_PATTERN.search(text):
+        score += 2
+    if PAYWALL_MULTI_PRICE_CLUSTER_PATTERN.search(text):
+        score += 2
+    if len(_keyword_hits(text, PAYWALL_CARD_BADGE_KEYWORDS)) >= 1:
+        score += 1
+    return score
 
 
 def is_probable_paywall_url(url: str) -> bool:
@@ -899,7 +1088,8 @@ def is_probable_paywall_url(url: str) -> bool:
             parsed.query or "",
             parsed.fragment or "",
         ])
-        return any(k in combined for k in PAYWALL_URL_KEYWORDS)
+        strong_url_hits = sum(1 for keyword in PAYWALL_URL_KEYWORDS if keyword in combined)
+        return strong_url_hits >= 1
     except:
         return False
 
@@ -913,33 +1103,117 @@ def detect_paywall_signals(page: Page) -> tuple[bool, str]:
     url = (page.url or "").lower()
     url_has_paywall_keyword = is_probable_paywall_url(url)
 
-    plan_hits = sum(1 for keyword in PAYWALL_PLAN_KEYWORDS if keyword in text)
-    cta_hits = sum(1 for keyword in PAYWALL_CTA_KEYWORDS if keyword in text)
-    limitation_hits = sum(1 for keyword in PAYWALL_LIMITATION_KEYWORDS if keyword in text)
-    trial_hits = sum(1 for keyword in PAYWALL_TRIAL_KEYWORDS if keyword in text)
-    comparison_hits = sum(1 for keyword in PAYWALL_COMPARISON_KEYWORDS if keyword in text)
+    plan_hits = _keyword_hits(text, PAYWALL_PLAN_KEYWORDS)
+    cta_hits = _keyword_hits(text, PAYWALL_CTA_KEYWORDS)
+    limitation_hits = _keyword_hits(text, PAYWALL_LIMITATION_KEYWORDS)
+    trial_hits = _keyword_hits(text, PAYWALL_TRIAL_KEYWORDS)
+    comparison_hits = _keyword_hits(text, PAYWALL_COMPARISON_KEYWORDS)
+    billing_hits = _keyword_hits(text, PAYWALL_BILLING_KEYWORDS)
+    access_hits = _keyword_hits(text, PAYWALL_ACCESS_KEYWORDS)
+    negative_hits = _keyword_hits(text, PAYWALL_NEGATIVE_KEYWORDS)
+    badge_hits = _keyword_hits(text, PAYWALL_CARD_BADGE_KEYWORDS)
+    checkout_hits = _keyword_hits(text, PAYWALL_CHECKOUT_KEYWORDS)
 
     has_price_symbol = any(symbol in text for symbol in ["$", "€", "£", "₽"])
     has_price_amount = bool(PAYWALL_PRICE_PATTERN.search(text))
     has_price = has_price_symbol or has_price_amount
+    has_multiple_prices = _has_multiple_prices(text)
+    has_price_context = _has_price_in_paywall_context(text)
+    has_periodic_price = bool(PAYWALL_PERIODIC_PRICE_PATTERN.search(text))
+    has_quiz_money_context = _has_quiz_money_context(text)
+    plan_option_count = _count_plan_option_titles(text)
+    commercial_price_score = _count_commercial_price_signals(text)
+    has_discount_signal = bool(PAYWALL_DISCOUNT_PATTERN.search(text))
+    has_plan_duration = bool(PAYWALL_PLAN_DURATION_PATTERN.search(text))
+    has_multi_price_cluster = bool(PAYWALL_MULTI_PRICE_CLUSTER_PATTERN.search(text))
 
-    has_plan_offer = plan_hits >= 2 or (plan_hits >= 1 and has_price)
-    has_subscription_cta = cta_hits >= 1
-    has_content_gating = limitation_hits >= 1
-    has_trial_offer = trial_hits >= 1
-    has_plan_comparison = comparison_hits >= 1 and (plan_hits >= 1 or has_price)
+    has_plan_offer = len(plan_hits) >= 2 or plan_option_count >= 2
+    has_subscription_cta = len(cta_hits) >= 2 or (len(cta_hits) >= 1 and (has_price_context or len(billing_hits) >= 1))
+    has_content_gating = len(limitation_hits) >= 1 or len(access_hits) >= 2
+    has_trial_offer = len(trial_hits) >= 2 or (len(trial_hits) >= 1 and len(billing_hits) >= 1)
+    has_plan_comparison = len(comparison_hits) >= 1 and (plan_option_count >= 2 or has_multiple_prices)
+    has_billing_context = len(billing_hits) >= 2 or has_periodic_price
+    has_checkout_context = len(checkout_hits) >= 1
+    has_pricing_cards = (
+        (has_multiple_prices or has_multi_price_cluster)
+        and (has_plan_offer or has_plan_duration or len(badge_hits) >= 1)
+    )
 
-    if url_has_paywall_keyword and (has_plan_offer or has_subscription_cta or has_content_gating or has_trial_offer or has_price):
-        return True, "Paywall keywords found in URL together with pricing/subscription content"
-
-    if has_price and (has_plan_offer or has_subscription_cta or has_trial_offer or has_plan_comparison):
-        return True, "Pricing combined with plans, CTA, trial, or comparison blocks"
-
+    strong_signals = 0
+    if has_plan_offer and (has_multiple_prices or has_plan_comparison):
+        strong_signals += 1
+    if has_billing_context and has_price_context:
+        strong_signals += 1
     if has_content_gating and (has_subscription_cta or has_trial_offer or has_plan_offer):
-        return True, "Content access restriction combined with subscription offer"
+        strong_signals += 1
+    if has_checkout_context and has_price_context:
+        strong_signals += 1
+    if has_trial_offer and has_billing_context:
+        strong_signals += 1
+    if has_pricing_cards and commercial_price_score >= 3:
+        strong_signals += 1
+    if url_has_paywall_keyword and (has_pricing_cards or has_checkout_context or has_billing_context):
+        strong_signals += 1
 
-    if has_plan_offer and has_subscription_cta and (has_trial_offer or has_plan_comparison):
-        return True, "Multiple paywall content signals detected"
+    weak_signals = 0
+    if url_has_paywall_keyword:
+        weak_signals += 1
+    if has_plan_offer:
+        weak_signals += 1
+    if has_subscription_cta:
+        weak_signals += 1
+    if has_content_gating:
+        weak_signals += 1
+    if has_trial_offer:
+        weak_signals += 1
+    if has_plan_comparison:
+        weak_signals += 1
+    if has_billing_context:
+        weak_signals += 1
+    if has_checkout_context:
+        weak_signals += 1
+    if has_price_context:
+        weak_signals += 1
+    if has_pricing_cards:
+        weak_signals += 1
+    if commercial_price_score >= 2:
+        weak_signals += 1
+
+    if has_quiz_money_context and strong_signals < 2 and commercial_price_score < 3:
+        return False, "Money-related quiz/leadgen context detected without enough subscription evidence"
+
+    if len(negative_hits) >= 3 and strong_signals < 2 and commercial_price_score < 3:
+        return False, "Quiz/leadgen anti-signals outweigh weak pricing indicators"
+
+    if has_price and not (has_price_context or has_billing_context or has_plan_comparison):
+        return False, "Standalone prices or money amounts without billing/subscription context"
+
+    if url_has_paywall_keyword and has_pricing_cards and (has_price_context or commercial_price_score >= 3):
+        return True, "Payment-like URL combined with pricing-card paywall content"
+
+    if has_pricing_cards and has_price_context and (has_subscription_cta or has_billing_context or has_discount_signal):
+        return True, "Pricing cards with commercial price context and subscription/discount signals detected"
+
+    if has_multi_price_cluster and has_plan_duration and (len(badge_hits) >= 1 or has_discount_signal or url_has_paywall_keyword):
+        return True, "Multiple plan prices with duration and badge/discount signals detected"
+
+    if url_has_paywall_keyword and strong_signals >= 2:
+        return True, "Strong paywall URL combined with multiple independent paywall signals"
+
+    if has_checkout_context and has_billing_context and has_price_context:
+        return True, "Checkout flow with billing and price context detected"
+
+    if has_content_gating and has_plan_offer and (has_billing_context or has_trial_offer or has_plan_comparison):
+        return True, "Content gating combined with plan selection and billing/trial context"
+
+    if has_plan_offer and has_plan_comparison and has_price_context and (has_billing_context or has_subscription_cta):
+        return True, "Multiple plan options with pricing and billing/CTA context detected"
+
+    if has_trial_offer and has_price_context and has_billing_context and (has_content_gating or has_plan_offer or has_subscription_cta):
+        return True, "Trial with billing commitment and subscription context detected"
+
+    if strong_signals >= 3 and weak_signals >= 4:
+        return True, "Several strong paywall indicators detected together"
 
     return False, "No reliable paywall signals detected"
 

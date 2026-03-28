@@ -80,7 +80,7 @@ cp .env.example .env
 
 ```ini
 TELEGRAM_BOT_TOKEN=1234567890:AABBccDDeeFFggHHiiJJkkLLmmNNooP
-TELEGRAM_ADMIN_ID=123456789
+ADMIN_IDS=123456789,987654321
 ```
 
 5. Запустите бота:
@@ -89,7 +89,7 @@ TELEGRAM_ADMIN_ID=123456789
 python bot.py
 ```
 
-**Примечание:** Токен и admin_id из `.env` имеют приоритет над значениями в `config.json`.
+**Примечание:** Токен и список администраторов из `.env` имеют приоритет над значениями в `config.json`. Для обратной совместимости старый `TELEGRAM_ADMIN_ID` тоже поддерживается, если `ADMIN_IDS` не задан.
 
 ## Конфигурация (`config.json`)
 
@@ -128,7 +128,7 @@ python bot.py
 
 ### Для Telegram-бота
 
-**Важно:** Токен и admin_id рекомендуется хранить в `.env` файле, а не в `config.json`.
+**Важно:** Токен и список администраторов рекомендуется хранить в `.env` файле, а не в `config.json`.
 
 ```json
 {
@@ -162,7 +162,8 @@ python bot.py
 | Переменная | Описание |
 |------------|----------|
 | `TELEGRAM_BOT_TOKEN` | Токен бота от @BotFather |
-| `TELEGRAM_ADMIN_ID` | Ваш Telegram User ID |
+| `ADMIN_IDS` | Список Telegram User ID администраторов через запятую |
+| `TELEGRAM_ADMIN_ID` | Legacy-переменная для одного администратора, используется только для обратной совместимости |
 | `GOOGLE_DRIVE_ENABLED` | Включение Google Drive интеграции через `.env` |
 | `GOOGLE_DRIVE_CREDENTIALS_FILE` | Путь к OAuth client JSON или service account JSON |
 | `GOOGLE_DRIVE_TOKEN_FILE` | Файл для сохранения OAuth токена |
@@ -174,6 +175,8 @@ python bot.py
 | Параметр | Описание |
 |----------|----------|
 | `use_only_admin` | Если `true`, только администраторы могут использовать бота |
+| `admin_ids` | Необязательный список Telegram User ID администраторов в `config.json`, если не используется `.env` |
+| `allowed_users` | Legacy-список разрешённых пользователей; больше не ограничивает доступ, если `use_only_admin=false` |
 
 ## Telegram-бот
 

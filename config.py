@@ -4,7 +4,7 @@
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 from dotenv import load_dotenv
 
 # Загрузка переменных окружения из .env
@@ -58,6 +58,79 @@ class CaptchaConfig:
     api_key: str = ""
 
 
+def _parse_bool(value, default: bool) -> bool:
+    """Безопасный парсинг bool-значения."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _normalize_user_ids(raw_value, *, field_name: str) -> List[int]:
+    """Нормализует список Telegram user id из строки/числа/массива."""
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, int):
+        return [raw_value]
+
+    if isinstance(raw_value, str):
+        parts = [part.strip() for part in raw_value.split(",")]
+        values: Iterable[str] = [part for part in parts if part]
+    elif isinstance(raw_value, (list, tuple, set)):
+        values = raw_value
+    else:
+        return []
+
+    normalized_ids: List[int] = []
+    seen_ids = set()
+
+    for value in values:
+        text_value = str(value).strip()
+        if not text_value:
+            continue
+        try:
+            parsed_id = int(text_value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{field_name} must contain only integer Telegram user IDs")
+
+        if parsed_id <= 0:
+            raise ValueError(f"{field_name} must contain only positive integer Telegram user IDs")
+
+        if parsed_id not in seen_ids:
+            normalized_ids.append(parsed_id)
+            seen_ids.add(parsed_id)
+
+    return normalized_ids
+
+
+def _resolve_admin_ids(bot_data: Dict) -> List[int]:
+    """Читает список администраторов из .env с обратной совместимостью."""
+    admin_ids_env = os.getenv("ADMIN_IDS", "").strip()
+    legacy_admin_id_env = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+
+    if admin_ids_env:
+        return _normalize_user_ids(admin_ids_env, field_name="ADMIN_IDS")
+
+    if legacy_admin_id_env:
+        return _normalize_user_ids(legacy_admin_id_env, field_name="TELEGRAM_ADMIN_ID")
+
+    admin_ids_value = bot_data.get("admin_ids")
+    if admin_ids_value is not None:
+        return _normalize_user_ids(admin_ids_value, field_name="bot.admin_ids")
+
+    legacy_admin_id_value = bot_data.get("admin_id")
+    if legacy_admin_id_value is not None:
+        return _normalize_user_ids(legacy_admin_id_value, field_name="bot.admin_id")
+
+    return []
+
+
 @dataclass
 class Config:
     """Основная конфигурация"""
@@ -85,15 +158,12 @@ class Config:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             token = bot_data.get("token", "")
-        
-        # Загружаем admin_id из переменных окружения (имеет приоритет)
-        admin_id = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
-        admin_ids = bot_data.get("admin_ids", [])
-        if admin_id:
-            try:
-                admin_ids = [int(admin_id)]
-            except ValueError:
-                pass
+
+        admin_ids = _resolve_admin_ids(bot_data)
+        allowed_users = _normalize_user_ids(
+            bot_data.get("allowed_users", []),
+            field_name="bot.allowed_users",
+        )
 
         runner_data = data.get("runner", {})
         drive_data = data.get("google_drive", {})
@@ -137,8 +207,8 @@ class Config:
             bot=BotConfig(
                 token=token,
                 admin_ids=admin_ids,
-                allowed_users=bot_data.get("allowed_users", []),
-                use_only_admin=bot_data.get("use_only_admin", True),
+                allowed_users=allowed_users,
+                use_only_admin=_parse_bool(bot_data.get("use_only_admin", True), True),
             ),
             runner=RunnerConfig(
                 max_steps=runner_data.get("max_steps", 80),

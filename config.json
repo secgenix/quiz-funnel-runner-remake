@@ -1,6 +1,6 @@
 {
   "bot": {
-    "use_only_admin": true
+    "use_only_admin": false
   },
   "runner": {
     "max_steps": 80,
@@ -50,7 +50,31 @@
     "https://signup.spiriohub.com/en/sfa7t7?utm_source=fb&utm_medium=%7B%7Bplacement%7D%7D&utm_campaign=5520_A10_SPw_TaiChiB_L-ALL_Te%E2%80%A6",
     "https://callyourdate.com/land/sp/1e2c6273/?id_visit_prev=2537368a-4d76-4474-b5e1-2ab90c799287#c3RlcDA=",
     "https://iq.mental-impulse.com/flow/iq_test_1",
-    "https://quiz.ayahpath.com/selectGender?lang=en&cohort=ap_pa_440_c&uuid=755debf3-7b82-4d66-a74e-5b3086a9b269"
+    "https://quiz.ayahpath.com/selectGender?lang=en&cohort=ap_pa_440_c&uuid=755debf3-7b82-4d66-a74e-5b3086a9b269",
+      "https://masterly.ai/promo/start?g=38276",
+  "https://creators.betterme.world/quiz/flows/4429",
+  "https://wisey-adhd.com/r/adhd-10?platform=web&utm_source=%7B%7Bsite_source_name%7D%7D&utm_medium=%7B%7Bplacement%7D%7D&utm_campaign=%7B%7Bca&p=0&q=0",
+  "https://apps.casavista.ai/it-8-8-2-1/welcome?affid=fa0a5e80-2770-11f1-8a36-b99415474500-mzb&arm=it-8-8-2-1&epayId=326&feature-flags=auth-capture%253A1&flow-mode=web&iteration=it-trials&landId=4049&ob-segment-id=hPHkTWzXUxpweAuzwAdw7pfIrKXyVr7x&payment-mode=production&payment-provider=1&r-chain=102785&reqid=Root%253D1-69c26f51-2d16f50725a9975f59044331&sid=dcea2378-01a6-47a5-a384-5a99b98489a7&traffic-source=facebook&trt=326_0&u-intent=Privacy&userDefiner=mzb_4326&utm-medium=%7B%7Bplaceme%E2%80%A6&utm-source=%7B%7Bsite_source_name%7D%7D&utm_campaign=casa_vista_major_link_trialit_8_8_2_1&utm_content=&utm_medium=mzb_4326&utm_source=facebook&utm_term=",
+  "https://hypnozio.com/landing-alc?l=en&vndr=hypalcfbmat",
+  "https://kodree.com/en/data/get-started",
+  "https://land.brighterly.com/reading-quiz",
+  "https://tailored-box.com/?lang=en&funnelld=580d33d1-80a0-4e90-befa-561ce9f2e194&utm_source=%7B%7Bsite_source_name%7D%7D&utm_camp%E2%80%A6",
+  "https://quiz.karmapaths.com/selectGenderKarma?lang=en&cohort=kp_bs_13_c&uuid=48ba4c9e-eba3-4561-9e3b-6b25a98514c5",
+  "https://quiz.the.coach/f_first?pixel_id=527326010373124&utm_source=%7B%7Bcampaign.name%7D%7D&utm_medium=%7B%7Badset.name%7D%7D&utm_campa%E2%80%A6#start_age",
+  "https://jobland.ai/en/start/application-boost",
+  "https://growth-plan.keiki.world/kw-fb-click-speechage-cpp-andr/?utm_source=facebook_cnv&utm_medium=cnv&utm_campaign=%7B%7Bca%E2%80%A6",
+  "https://coursiv.io/dynamic?prc_id=1069",
+  "https://coursiv.io/dynamic",
+  "https://dance-bit.com/welcomeBellyRef",
+  "https://madmuscles.com/funnel/default-uni-soft-new/step-one",
+  "https://quiz.fitme.expert/intro-111",
+  "https://asknebula.com/flow/lp/simple-registration",
+"https://signup.ruutlabs.com/en/rcv/v2?gbUserId=fce",
+"https://quiz.wellverse.app/pr-tion",
+"https://skin.luvly.care/age-makeup?cohort=luvly_fl_makeup&lang=en&utm_source=%7B%7Bsite_source_name%7D%7D&utm_medium=cpm&ad_id=&uuid=a2d8df6e-0cd2-45c8-b3f3-e34c562b9a4b",
+"https://wf.epictok.me/proj_1ecb3f7327b543d499e605b4dd6640c5/flow_f523800b644c40cd8680e8effcc9f6d0?utm-source=%7B%7Bsite_sour%E2%80%A6",
+"https://quiz.the.coach/split_sias_new1?utm_source=%7B%7Bcampaign.name%7D%7D&utm_medium=%7B%7Badset.name%7D%7D&utm_campaign=%7B%7Bad.name%7D%7D&campaign_id=#gender_split"
+ 
  
   ]
 }
