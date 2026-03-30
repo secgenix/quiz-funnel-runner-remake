@@ -1,0 +1,2953 @@
+﻿import json, argparse, os, time, re, hashlib, shutil
+from urllib.parse import urlparse
+from playwright.sync_api import sync_playwright, Page, TimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
+from datetime import datetime
+from ai_fallback import run_ai_fallback, resolve_ai_fallback_settings
+
+# Директория для сохранения артефактов ошибок
+ERRORS_DIR = "errors"
+
+COOKIE_BLACKLIST = [
+    "settings", "preferences", "customize", "options", "more info", 
+    "einstellungen", "optionen", "mehr informationen", 
+    "cookie settings", "privacy settings", "datenschutzeinstellungen",
+    "manage", "preferences"
+]
+
+SHARE_BLACKLIST = [
+    "share", "sharing", "tell a friend", "invite", "recommend",
+    "РїРѕРґРµР»РёС‚СЊСЃСЏ", "РїРѕРґРµР»РёСЃСЊ", "СЂР°СЃСЃРєР°Р·Р°С‚СЊ", "РїСЂРёРіР»Р°СЃРёС‚СЊ",
+    "view more", "show less", "read more", "back", "zurГјck", "РЅР°Р·Р°Рґ",
+    "previous", "go back", "edit answer", "contact us", "support", "help center", "cookie policy"
+]
+
+FORBIDDEN_PATTERN = re.compile(r"\b(" + "|".join(re.escape(w) for w in SHARE_BLACKLIST) + r")\b")
+FILLABLE_INPUT_SELECTOR = (
+    "input:visible:not([type='hidden']):not([type='radio']):not([type='checkbox']):"
+    "not([type='submit']):not([type='button']):not([type='image']):not([type='reset']):"
+    "not([type='file']), textarea:visible"
+)
+CONSENT_TEXT_KEYS = [
+    "terms", "privacy", "policy", "by continuing", "agree", "consent",
+    "услов", "политик", "соглас"
+]
+
+ACTION_KEYWORDS = [
+    "continue", "next", "submit", "verify", "confirm", "proceed", "get started",
+    "start", "show my results", "see my results", "i'm in", "i’m in", "go on",
+    "keep going", "done", "finish", "ok", "okay", "got it", "claim", "unlock",
+    "continuar", "siguiente", "verificar", "confirmar", "weiter", "suivant", "continuer",
+    "продолжить", "подтвердить", "отправить", "далее", "готово"
+]
+
+QUESTION_NEGATIVE_TERMS = [
+    "cookie", "cookies", "privacy", "settings", "preferences", "manage", "share",
+    "view more", "show less", "read more", "go to previous", "previous question",
+    "previous step", "back", "zurück", "назад", "app store", "google play", "download app",
+    "cookie policy", "contact us", "contact", "support", "help", "go back", "previous", "edit answer"
+]
+
+SELECT_ALL_KEYWORDS = [
+    "select all", "choose all", "all of the above", "seleccionar todo", "выбрать всё",
+    "выбрать все", "tout sélectionner", "alle auswählen"
+]
+
+
+def _js_interaction_helpers() -> str:
+    return r"""
+        const normalizeText = (...parts) => parts
+            .filter(Boolean)
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        const isElementVisible = (el) => {
+            if (!el || !el.isConnected) return false;
+            if (el.closest('[hidden], [aria-hidden="true"], inert')) return false;
+            const s = window.getComputedStyle(el);
+            if (!s) return false;
+            if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') return false;
+            if (parseFloat(s.opacity || '1') <= 0.02) return false;
+            if (s.pointerEvents === 'none') return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 6 || r.height < 6) return false;
+            if (r.right < 0 || r.bottom < 0 || r.left > window.innerWidth || r.top > window.innerHeight) return false;
+            return true;
+        };
+
+        const viewportRatio = (rect) => {
+            if (!rect) return 0;
+            const left = Math.max(0, rect.left);
+            const top = Math.max(0, rect.top);
+            const right = Math.min(window.innerWidth, rect.right);
+            const bottom = Math.min(window.innerHeight, rect.bottom);
+            const width = Math.max(0, right - left);
+            const height = Math.max(0, bottom - top);
+            const area = Math.max(1, rect.width * rect.height);
+            return (width * height) / area;
+        };
+
+        const getElementText = (el) => normalizeText(
+            el.innerText || '',
+            el.textContent || '',
+            el.value || '',
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            el.getAttribute('alt') || '',
+            el.getAttribute('placeholder') || ''
+        );
+
+        const isDisabledElement = (el) => {
+            if (!el) return true;
+            if (el.disabled || el.hasAttribute('disabled')) return true;
+            const ariaDisabled = normalizeText(el.getAttribute('aria-disabled') || '');
+            if (ariaDisabled === 'true') return true;
+            return false;
+        };
+
+        const isProbablyClickable = (el) => {
+            if (!el) return false;
+            const tag = (el.tagName || '').toLowerCase();
+            const role = normalizeText(el.getAttribute('role') || '');
+            const style = window.getComputedStyle(el);
+            return ['button', 'a', 'label', 'summary', 'option'].includes(tag)
+                || role === 'button'
+                || role === 'option'
+                || typeof el.onclick === 'function'
+                || el.hasAttribute('data-testid')
+                || el.hasAttribute('tabindex')
+                || style.cursor === 'pointer';
+        };
+
+        const isTopMostForClick = (el) => {
+            if (!isElementVisible(el)) return false;
+            const rect = el.getBoundingClientRect();
+            const points = [
+                [rect.left + rect.width / 2, rect.top + rect.height / 2],
+                [rect.left + Math.min(rect.width - 2, Math.max(2, rect.width * 0.25)), rect.top + Math.min(rect.height - 2, Math.max(2, rect.height * 0.25))],
+                [rect.right - Math.min(rect.width - 2, Math.max(2, rect.width * 0.25)), rect.bottom - Math.min(rect.height - 2, Math.max(2, rect.height * 0.25))]
+            ];
+            for (const [x, y] of points) {
+                if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) continue;
+                const topEl = document.elementFromPoint(x, y);
+                if (!topEl) continue;
+                if (topEl === el || el.contains(topEl) || topEl.contains(el)) return true;
+            }
+            return false;
+        };
+
+        const clickElementReliably = (el) => {
+            if (!el) return false;
+            try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) {}
+            try { el.focus({ preventScroll: true }); } catch (e) {}
+            try {
+                ['pointerdown','mousedown','mouseup','pointerup','click'].forEach(evt => {
+                    try { el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+                });
+            } catch (e) {}
+            try { el.click(); return true; } catch (e) {}
+            return false;
+        };
+    """
+
+
+def is_forbidden_button(el, log_func=None) -> bool:
+    """
+    Проверка кнопки на "запрещенность" (cookie, share и т.п.)
+    
+    Универсальная проверка - не маркируем варианты выбора (male/female и т.п.) как cookie
+    """
+    try:
+        txt = (el.inner_text() or "").lower()
+        alabel = (el.get_attribute("aria-label") or "").lower()
+        cls = (el.get_attribute("class") or "").lower()
+        html = (el.evaluate("el => el.innerHTML") or "").lower()
+        full_text = f"{txt} {alabel} {cls} {html}"
+
+        forbidden = False
+        reason = ""
+        
+        # Проверяем на cookie-кнопки - только если есть явные маркеры cookie/settings
+        # Не маркируем простые варианты выбора как cookie
+        cookie_indicators = ["cookie", "cookies", "privacy settings", "cookie settings", 
+                           "preferences", "customize", "options", "more info",
+                           "einstellungen", "optionen", "mehr informationen",
+                           "cookie settings", "privacy settings", "datenschutzeinstellungen",
+                           "manage cookies", "cookie policy"]
+        
+        if any(indicator in full_text for indicator in cookie_indicators):
+            # Дополнительная проверка - если это явно вариант выбора (короткий текст без cookie-терминов)
+            # то не считаем его запрещенным
+            if txt.strip() and len(txt.strip()) < 20 and "cookie" not in txt and "settings" not in txt:
+                # Это вероятно вариант выбора, а не cookie кнопка
+                pass
+            else:
+                forbidden = True
+                reason = "cookie"
+        
+        if FORBIDDEN_PATTERN.search(full_text):
+            forbidden = True
+            reason = "forbidden_ui"
+
+        if forbidden and log_func and txt.strip():
+            log_func(f"Пропущена запрещенная кнопка={reason} | текст: {txt.strip()[:30]}")
+        return forbidden
+    except:
+        return False
+
+def get_choices_text(page: Page, log_func=None):
+    try:
+        choice_sel = [
+            "[data-testid*='answer' i]:visible", 
+            "button:visible", 
+            "[class*='Item' i]:visible", 
+            "[class*='Card' i]:visible", 
+            "label:visible"
+        ]
+        for s in choice_sel:
+            els = page.locator(s)
+            texts = []
+            els_count = els.count()
+            for i in range(els_count):
+                curr = els.nth(i)
+                if is_forbidden_button(curr, log_func): continue
+                txt = safe_inner_text(curr, "")
+                if txt and not re.search(r'\d+\s*/\s*\d+', txt) and len(txt) < 100:
+                    texts.append(txt)
+            if texts:
+                return "|".join(texts[:3])
+        return ""
+    except: return ""
+
+
+def safe_inner_text(locator, fallback: str = "") -> str:
+    try:
+        return (locator.inner_text() or fallback).strip()
+    except:
+        try:
+            return (locator.evaluate("el => (el.innerText || el.textContent || '').trim()") or fallback).strip()
+        except:
+            return fallback
+
+def get_ui_step(page: Page):
+    try:
+        # Improved regex: require total >= 10 to avoid 24/7, or ensure current <= total
+        def extract_step(text):
+            # Look for patterns like "3 / 23" or "3/23"
+            matches = re.finditer(r'(\d+)\s*/\s*(\d+)', text)
+            for m in matches:
+                curr, total = int(m.group(1)), int(m.group(2))
+                # Heuristic: quiz progress usually has total > 5 and curr <= total
+                # and we specifically ignore 24/7
+                if total > 5 and curr <= total and f"{curr}/{total}" != "24/7":
+                    return f"{curr}/{total}"
+            return None
+
+        # Look in visible text first
+        t = page.evaluate("() => document.body.innerText")
+        res = extract_step(t)
+        if res: return res
+        
+        # Look in all elements if not found
+        res = page.evaluate(r"""() => {
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+            let node;
+            while(node = walker.nextNode()) {
+                const m = node.textContent.match(/(\d+)\s*\/\s*(\d+)/);
+                if (m) {
+                    const c = parseInt(m[1]), t = parseInt(m[2]);
+                    if (t > 5 && c <= t && m[0].trim() !== "24/7") return m[0].trim();
+                }
+            }
+            return null;
+        }""")
+        if res: return res.replace(" ", "")
+    except: pass
+    return "unknown"
+
+def get_slug(url: str):
+    p = urlparse(url); d = p.netloc.replace('www.', ''); pth = p.path.strip('/').replace('/', '-')
+    slug = f"{d}-{pth}" if pth else d
+    if p.query:
+        q_hash = hashlib.md5(p.query.encode()).hexdigest()[:6]
+        slug = f"{slug}-{q_hash}"
+    return slug
+
+def get_screen_hash(page: Page):
+    try:
+        t = page.evaluate("() => (document.body.innerText || '').slice(0, 10000)")
+        return hashlib.md5(t.encode('utf-8')).hexdigest()
+    except: return ""
+
+
+def save_error_artifacts(page: Page, url: str, error_message: str, log_lines: list, log_func) -> str:
+    """
+    Сохраняет DOM-дерево, код страницы, скриншот и логи при ошибке.
+    
+    Args:
+        page: Playwright страница
+        url: URL где произошла ошибка
+        error_message: Описание ошибки
+        log_lines: Список строк лога
+        log_func: Функция логирования
+    
+    Returns:
+        Путь к папке с артефактами ошибки
+    """
+    try:
+        # Создаем папку для ошибок
+        os.makedirs(ERRORS_DIR, exist_ok=True)
+        
+        # Генерируем имя папки на основе домена и timestamp
+        parsed = urlparse(url)
+        domain = parsed.netloc.replace('www.', '')
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        error_folder = os.path.join(ERRORS_DIR, f"{domain}_{timestamp}")
+        os.makedirs(error_folder, exist_ok=True)
+        
+        log_func(f"Сохранение артефактов ошибки в {error_folder}")
+        
+        # 1. Сохраняем DOM-дерево
+        try:
+            dom_content = page.evaluate("() => document.documentElement.outerHTML")
+            dom_path = os.path.join(error_folder, "dom.html")
+            with open(dom_path, 'w', encoding='utf-8') as f:
+                f.write(dom_content)
+            log_func(f"DOM сохранен: {dom_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения DOM: {str(e)[:80]}")
+        
+        # 2. Сохраняем весь JavaScript код со страницы
+        try:
+            scripts_content = []
+            scripts = page.query_selector_all("script")
+            for idx, script in enumerate(scripts):
+                try:
+                    src = script.get_attribute("src")
+                    if src:
+                        # Внешний скрипт - сохраняем ссылку
+                        scripts_content.append(f"/* External script: {src} */")
+                    else:
+                        # Inline скрипт - сохраняем содержимое
+                        inner_html = script.inner_text() or script.evaluate("el => el.innerHTML")
+                        if inner_html:
+                            scripts_content.append(f"/* Inline script #{idx} */\n{inner_html}")
+                except:
+                    pass
+            
+            scripts_path = os.path.join(error_folder, "scripts.js")
+            with open(scripts_path, 'w', encoding='utf-8') as f:
+                f.write('\n\n'.join(scripts_content[:50]))  # Ограничиваем 50 скриптами
+            log_func(f"Скрипты сохранены: {scripts_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения скриптов: {str(e)[:80]}")
+        
+        # 3. Сохраняем CSS стили
+        try:
+            styles_content = []
+            styles = page.query_selector_all("style, link[rel='stylesheet']")
+            for idx, style in enumerate(styles[:30]):  # Ограничиваем 30 стилями
+                try:
+                    href = style.get_attribute("href")
+                    if href:
+                        styles_content.append(f"/* External stylesheet: {href} */")
+                    else:
+                        inner_html = style.inner_text() or style.evaluate("el => el.innerHTML")
+                        if inner_html:
+                            styles_content.append(f"/* Inline style #{idx} */\n{inner_html}")
+                except:
+                    pass
+            
+            styles_path = os.path.join(error_folder, "styles.css")
+            with open(styles_path, 'w', encoding='utf-8') as f:
+                f.write('\n\n'.join(styles_content))
+            log_func(f"Стили сохранены: {styles_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения стилей: {str(e)[:80]}")
+        
+        # 4. Сохраняем скриншот
+        try:
+            screenshot_path = os.path.join(error_folder, "screenshot.png")
+            page.screenshot(path=screenshot_path, full_page=True)
+            log_func(f"Скриншот сохранен: {screenshot_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения скриншота: {str(e)[:80]}")
+        
+        # 5. Сохраняем логи
+        try:
+            log_path = os.path.join(error_folder, "error_log.txt")
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write(f"URL: {url}\n")
+                f.write(f"Ошибка: {error_message}\n")
+                f.write(f"Время: {datetime.now().isoformat()}\n")
+                f.write(f"User Agent: {page.evaluate('() => navigator.userAgent')}\n")
+                f.write(f"Viewport: {page.evaluate('() => JSON.stringify({width: window.innerWidth, height: window.innerHeight})')}\n")
+                f.write("\n=== Логи ===\n\n")
+                f.write('\n'.join(log_lines[-200:]))  # Последние 200 строк лога
+            log_func(f"Логи сохранены: {log_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения логов: {str(e)[:80]}")
+        
+        # 6. Сохраняем информацию о странице (metadata)
+        try:
+            metadata = {
+                "url": url,
+                "error": error_message,
+                "timestamp": datetime.now().isoformat(),
+                "user_agent": page.evaluate("() => navigator.userAgent"),
+                "viewport": {
+                    "width": page.evaluate("() => window.innerWidth"),
+                    "height": page.evaluate("() => window.innerHeight"),
+                },
+                "page_title": page.title(),
+                "cookies_count": len(page.context.cookies()),
+                "local_storage": page.evaluate("() => { try { return Object.keys(localStorage).length; } catch(e) { return 0; } }"),
+                "session_storage": page.evaluate("() => { try { return Object.keys(sessionStorage).length; } catch(e) { return 0; } }"),
+            }
+            metadata_path = os.path.join(error_folder, "metadata.json")
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            log_func(f"Метаданные сохранены: {metadata_path}")
+        except Exception as e:
+            log_func(f"Ошибка сохранения метаданных: {str(e)[:80]}")
+        
+        # 7. Сохраняем console.log ошибки если есть
+        try:
+            console_errors = page.evaluate("""() => {
+                if (window.__qwen_console_errors) {
+                    return window.__qwen_console_errors;
+                }
+                return [];
+            }""")
+            if console_errors:
+                console_path = os.path.join(error_folder, "console_errors.txt")
+                with open(console_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(console_errors))
+                log_func(f"Console ошибки сохранены: {console_path}")
+        except:
+            pass
+        
+        log_func(f"✅ Артефакты ошибки сохранены в {error_folder}")
+        return error_folder
+        
+    except Exception as e:
+        log_func(f"❌ Критическая ошибка при сохранении артефактов: {str(e)[:120]}")
+        return ""
+
+def close_popups(page: Page, log_func):
+    try:
+        whitelist = ['Accept', 'Accept all', 'Allow all', 'I agree', 'Agree', 'РџСЂРёРЅСЏС‚СЊ', 'РџСЂРёРЅСЏС‚СЊ РІСЃРµ', 'Р Р°Р·СЂРµС€РёС‚СЊ', 'РЎРѕРіР»Р°СЃРµРЅ', 'Alle akzeptieren', 'Alle ablehnen']
+        clicked = False
+        cookie_found = False
+        
+        btns = page.locator("button:visible, [role='button']:visible, a.button:visible")
+        btn_count = btns.count()
+        for i in range(btn_count):
+            btn = btns.nth(i)
+            txt = (btn.inner_text() or "").strip()
+            if not txt: continue
+            if is_forbidden_button(btn, log_func):
+                cookie_found = True
+                continue
+            
+            lower_txt = txt.lower()
+            if any(w.lower() == lower_txt or w.lower() in lower_txt for w in whitelist):
+                cookie_found = True
+                try:
+                    btn.click(timeout=1000)
+                    log_func(f"Cookie: обычный клик | текст: {txt}")
+                except:
+                    btn.click(force=True, timeout=1000)
+                    log_func(f"Cookie: принудительный клик | текст: {txt}")
+                clicked = True; break
+        
+        hidden_provider = page.evaluate("""() => {
+            const providers = [
+                '#onetrust-banner-sdk', '#onetrust-accept-btn-handler', '.onetrust-close-btn-handler',
+                '#truste-consent-track', '#consent_blackbar',
+                '.qc-cmp2-container', '.qc-cmp2-summary-buttons button',
+                '#cookie-law-info-bar', '#cookie_action_close_header', '.cky-btn-accept'
+            ];
+            let hidden = false;
+            providers.forEach(s => { 
+                document.querySelectorAll(s).forEach(el => {
+                    if (el.style.display !== 'none') {
+                        el.style.display = 'none';
+                        hidden = true;
+                    }
+                });
+            });
+            return hidden;
+        }""")
+        
+        if hidden_provider:
+            cookie_found = True
+            log_func("Cookie: скрыт CSS-правилами провайдера")
+
+        hidden_fallback = page.evaluate("""() => {
+            let hidden = false;
+            const els = Array.from(document.querySelectorAll('*')).filter(el => {
+                const style = window.getComputedStyle(el);
+                return (style.position === 'fixed' || style.position === 'sticky') && style.display !== 'none';
+            });
+            
+            els.forEach(el => {
+                const t = el.innerText.toLowerCase();
+                if (t.includes('cookie') || t.includes('consent') || t.includes('privacy')) {
+                    const primary = ['continue', 'next', 'submit', 'get my plan', 'claim', 'spin', 'start'];
+                    if (!primary.some(w => t.includes(w))) { 
+                        el.style.display = 'none'; 
+                        hidden = true;
+                    }
+                }
+            });
+            return hidden;
+        }""")
+        
+        if hidden_fallback:
+            cookie_found = True
+            log_func("Cookie: скрыт fallback CSS")
+
+        closed_modal = page.evaluate("""() => {
+            const isVisible = (el) => {
+                if (!el) return false;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 24 && r.height > 24;
+            };
+
+            const overlays = Array.from(document.querySelectorAll('*')).filter(el => {
+                if (!isVisible(el)) return false;
+                const s = window.getComputedStyle(el);
+                const txt = (el.innerText || '').toLowerCase();
+                const r = el.getBoundingClientRect();
+                const fixedLike = ['fixed', 'sticky', 'absolute'].includes(s.position);
+                const helpLike = txt.includes('need some help') || txt.includes('we will be glad to assist') || txt.includes('support@');
+                const dialogLike = el.getAttribute('role') === 'dialog' || el.getAttribute('aria-modal') === 'true';
+                return fixedLike && r.width > window.innerWidth * 0.45 && r.height > 80 && (helpLike || dialogLike);
+            });
+
+            for (const overlay of overlays) {
+                const candidates = Array.from(overlay.querySelectorAll('button, [role="button"], a, div, span')).filter(isVisible);
+                for (const el of candidates) {
+                    const txt = [
+                        (el.innerText || '').trim(),
+                        (el.getAttribute('aria-label') || '').trim(),
+                        (el.getAttribute('title') || '').trim()
+                    ].join(' ').toLowerCase();
+                    const rect = el.getBoundingClientRect();
+                    const looksClose = txt === '×' || txt === 'x' || txt.includes('close') || txt.includes('dismiss');
+                    const smallCircle = rect.width <= 72 && rect.height <= 72;
+                    if (looksClose || smallCircle) {
+                        try { el.click(); return true; } catch (e) {}
+                    }
+                }
+            }
+            return false;
+        """)
+
+        if closed_modal:
+            log_func("Popup/modal: закрыт generic close fallback")
+
+        if cookie_found:
+            log_func("Cookie-баннер обнаружен")
+            
+    except: pass
+
+
+def ensure_privacy_checkbox_checked(page: Page, log_func) -> bool:
+    try:
+        keywords = ["I have read and understood", "consent to the processing", "personal data"]
+        found_text = None
+        for kw in keywords:
+            elements = page.get_by_text(kw, exact=False)
+            elements_count = elements.count()
+            for i in range(elements_count):
+                el = elements.nth(i)
+                if el.is_visible(timeout=500): found_text = el; break
+            if found_text: break
+        
+        if not found_text: return False
+        container = found_text.locator("xpath=./ancestor::*[self::label or self::div][1]").first
+        checkbox = container.locator("input[type='checkbox']").first
+        if checkbox.count() > 0:
+            if not checkbox.is_checked(): checkbox.click(force=True, timeout=1000)
+            return checkbox.is_checked()
+        container.click(force=True, timeout=1000)
+        return True
+    except: return False
+
+
+def ensure_consent_checkbox_checked(page: Page, log_func) -> bool:
+    try:
+        page_text = ""
+        try:
+            page_text = (page.evaluate("() => document.body.innerText || ''") or "").lower()
+        except:
+            pass
+
+        must_accept = any(k in page_text for k in CONSENT_TEXT_KEYS) or "to continue, please accept" in page_text
+        checked_any = False
+
+        role_boxes = page.locator("[role='checkbox']:visible")
+        role_count = role_boxes.count()
+        for i in range(role_count):
+            rb = role_boxes.nth(i)
+            try:
+                state = (rb.get_attribute("aria-checked") or "").lower()
+                if state == "true":
+                    continue
+                rb.click(force=True, timeout=1000)
+                if (rb.get_attribute("aria-checked") or "").lower() == "true":
+                    checked_any = True
+                    log_func("Чекбокс согласия отмечен (role=checkbox)")
+            except:
+                pass
+
+        checkboxes = page.locator("input[type='checkbox']")
+        cb_count = checkboxes.count()
+        for i in range(cb_count):
+            cb = checkboxes.nth(i)
+            try:
+                if cb.is_checked():
+                    continue
+            except:
+                continue
+
+            try:
+                wrapper_text = (
+                    cb.locator("xpath=./ancestor::*[self::label or self::div][1]")
+                    .inner_text()
+                    .lower()
+                )
+            except:
+                wrapper_text = ""
+
+            is_relevant = any(k in wrapper_text for k in CONSENT_TEXT_KEYS) if wrapper_text else must_accept
+            if not is_relevant:
+                continue
+
+            try:
+                cb.check(timeout=1000)
+            except:
+                try:
+                    cb.click(force=True, timeout=1000)
+                except:
+                    try:
+                        cb_id = (cb.get_attribute("id") or "").strip()
+                        if cb_id:
+                            label_for = page.locator(f"label[for='{cb_id}']").first
+                            if label_for.count() > 0:
+                                label_for.click(force=True, timeout=1000)
+                            else:
+                                cb.locator("xpath=./ancestor::*[self::label or self::div][1]").click(force=True, timeout=1000)
+                        else:
+                            cb.locator("xpath=./ancestor::*[self::label or self::div][1]").click(force=True, timeout=1000)
+                    except:
+                        continue
+
+            try:
+                if cb.is_checked():
+                    checked_any = True
+                    log_func("Чекбокс согласия отмечен")
+            except:
+                pass
+
+        if not checked_any and must_accept:
+            try:
+                consent_label = page.get_by_text("By continuing, you agree", exact=False).first
+                if consent_label.count() > 0:
+                    consent_label.click(force=True, timeout=1000)
+                    log_func("Попытка отметить согласие кликом по тексту условий")
+            except:
+                pass
+
+        return checked_any
+    except:
+        return False
+
+
+def check_and_handle_form_blockers(page: Page, log_func) -> bool:
+    """
+    Универсальная JS-функция для обнаружения и обработки блокираторов форм:
+    - Отсутствующие обязательные поля
+    - Disabled кнопки
+    - Скрытые ошибки валидации
+    - Блокирующие overlay
+    
+    Returns True если были обнаружены и обработаны блокираторы
+    """
+    try:
+        blockers_handled = page.evaluate("""() => {
+            let handled = false;
+            
+            // 1. Проверяем есть ли disabled кнопка Continue/Next с незаполненными полями
+            const disabledButtons = Array.from(document.querySelectorAll('button:disabled, [disabled] button, [aria-disabled="true"]'));
+            const continueKeywords = ['continue', 'next', 'get started', 'submit', 'start', 'get my'];
+            
+            for (const btn of disabledButtons) {
+                const txt = (btn.innerText || '').toLowerCase();
+                if (continueKeywords.some(k => txt.includes(k))) {
+                    // Кнопка disabled - ищем незаполненные обязательные поля
+                    const requiredInputs = Array.from(document.querySelectorAll('input[required]:not([type="hidden"]), textarea[required]'));
+                    const emptyRequired = requiredInputs.filter(inp => !inp.value || inp.value.trim() === '');
+                    
+                    if (emptyRequired.length > 0) {
+                        // Пытаемся заполнить первое пустое поле
+                        const firstEmpty = emptyRequired[0];
+                        if (firstEmpty.type === 'email') {
+                            firstEmpty.value = 'test' + Date.now() + '@gmail.com';
+                        } else if (firstEmpty.type === 'tel') {
+                            firstEmpty.value = '1234567890';
+                        } else if (firstEmpty.type === 'number') {
+                            firstEmpty.value = '25';
+                        } else {
+                            firstEmpty.value = 'John';
+                        }
+                        firstEmpty.dispatchEvent(new Event('input', { bubbles: true }));
+                        firstEmpty.dispatchEvent(new Event('change', { bubbles: true }));
+                        handled = true;
+                        break;
+                    }
+                }
+            }
+            
+            // 2. Проверяем наличие overlay блокирующих клики
+            const overlays = Array.from(document.querySelectorAll('*')).filter(el => {
+                const style = window.getComputedStyle(el);
+                return (
+                    style.position === 'fixed' && 
+                    style.zIndex && 
+                    parseInt(style.zIndex) > 1000 &&
+                    style.display !== 'none' &&
+                    style.opacity !== '0' &&
+                    el.offsetWidth > window.innerWidth * 0.5 &&
+                    el.offsetHeight > window.innerHeight * 0.5
+                );
+            });
+            
+            for (const overlay of overlays) {
+                // Проверяем не является ли это cookie-баннером
+                const overlayText = (overlay.innerText || '').toLowerCase();
+                if (!overlayText.includes('cookie') && !overlayText.includes('privacy')) {
+                    // Пытаемся скрыть overlay
+                    overlay.style.display = 'none';
+                    overlay.style.visibility = 'hidden';
+                    overlay.style.pointerEvents = 'none';
+                    handled = true;
+                }
+            }
+            
+            // 3. Проверяем скрытые ошибки валидации
+            const errorMessages = Array.from(document.querySelectorAll('[role="alert"], .error-message, .validation-error, [class*="error" i], [class*="invalid" i]'));
+            for (const err of errorMessages) {
+                if (err.offsetWidth > 0 && err.offsetHeight > 0) {
+                    const errText = (err.innerText || '').toLowerCase();
+                    if (errText.includes('required') || errText.includes('must') || errText.includes('valid')) {
+                        // Находим связанное поле и пытаемся исправить
+                        const relatedInput = err.querySelector('input') || 
+                                           document.querySelector('input:focus') ||
+                                           document.querySelector('input[aria-invalid="true"]');
+                        if (relatedInput) {
+                            relatedInput.value = relatedInput.type === 'email' ? 
+                                'test@gmail.com' : 'John';
+                            relatedInput.dispatchEvent(new Event('input', { bubbles: true }));
+                            handled = true;
+                        }
+                    }
+                }
+            }
+            
+            // 4. Проверяем чекбоксы согласия которые могут блокировать
+            const consentCheckboxes = Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(cb => {
+                const label = cb.closest('label') || document.querySelector(`label[for="${cb.id}"]`);
+                const labelTxt = (label?.innerText || '').toLowerCase();
+                return labelTxt.includes('agree') || labelTxt.includes('terms') || labelTxt.includes('privacy');
+            });
+            
+            for (const cb of consentCheckboxes) {
+                if (!cb.checked) {
+                    cb.checked = true;
+                    cb.dispatchEvent(new Event('change', { bubbles: true }));
+                    handled = true;
+                }
+            }
+            
+            return handled;
+        }""")
+        
+        if blockers_handled:
+            log_func("Form blockers: обнаружены и обработаны блокираторы формы через JS")
+        
+        return blockers_handled
+        
+    except Exception as e:
+        log_func(f"Form blockers: ошибка проверки: {str(e)[:80]}")
+        return False
+
+
+def detect_page_stuck_state(page: Page, log_func) -> dict:
+    """
+    JS-функция для детекции "зависшего" состояния страницы.
+    Возвращает информацию о состоянии и рекомендации.
+    
+    Returns:
+        dict с полями: is_stuck, reason, suggestion
+    """
+    try:
+        stuck_info = page.evaluate("""() => {
+            const result = {
+                is_stuck: false,
+                reason: null,
+                suggestion: null,
+                details: {}
+            };
+            
+            // 1. Проверяем наличие активных loading индикаторов
+            const loadingElements = Array.from(document.querySelectorAll('[class*="loading" i], [class*="spinner" i], [role="progressbar"]'));
+            const visibleLoading = loadingElements.some(el => {
+                const style = window.getComputedStyle(el);
+                return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+            });
+            
+            if (visibleLoading) {
+                result.is_stuck = true;
+                result.reason = 'loading_in_progress';
+                result.suggestion = 'wait_longer';
+                result.details.loading_count = loadingElements.length;
+                return result;
+            }
+            
+            // 2. Проверяем есть ли незаполненные обязательные поля при disabled кнопке
+            const disabledContinue = Array.from(document.querySelectorAll('button:disabled')).find(btn => {
+                const txt = (btn.innerText || '').toLowerCase();
+                return ['continue', 'next', 'get started', 'submit'].some(k => txt.includes(k));
+            });
+            
+            if (disabledContinue) {
+                const requiredEmpty = Array.from(document.querySelectorAll('input[required]:not([type="hidden"])'))
+                    .filter(inp => !inp.value || inp.value.trim() === '');
+                
+                if (requiredEmpty.length > 0) {
+                    result.is_stuck = true;
+                    result.reason = 'required_fields_empty';
+                    result.suggestion = 'fill_required_fields';
+                    result.details.empty_fields = requiredEmpty.length;
+                    return result;
+                }
+            }
+            
+            // 3. Проверяем наличие blocking iframe (например cookie consent)
+            const iframes = Array.from(document.querySelectorAll('iframe'));
+            const blockingIframe = iframes.find(iframe => {
+                const style = window.getComputedStyle(iframe);
+                return (
+                    style.position === 'fixed' &&
+                    style.zIndex && 
+                    parseInt(style.zIndex) > 999 &&
+                    iframe.offsetWidth > window.innerWidth * 0.8 &&
+                    iframe.offsetHeight > window.innerHeight * 0.8
+                );
+            });
+            
+            if (blockingIframe) {
+                result.is_stuck = true;
+                result.reason = 'blocking_iframe';
+                result.suggestion = 'close_iframe_or_wait';
+                result.details.iframe_src = blockingIframe.src;
+                return result;
+            }
+            
+            // 4. Проверяем наличие JavaScript ошибок в консоли
+            if (window.__qwen_console_errors && window.__qwen_console_errors.length > 0) {
+                const recentErrors = window.__qwen_console_errors.slice(-5);
+                const hasBlockingError = recentErrors.some(err => 
+                    err.includes('Uncaught') || 
+                    err.includes('TypeError') || 
+                    err.includes('ReferenceError')
+                );
+                
+                if (hasBlockingError) {
+                    result.is_stuck = true;
+                    result.reason = 'javascript_errors';
+                    result.suggestion = 'try_click_anyway_or_reload';
+                    result.details.errors = recentErrors;
+                    return result;
+                }
+            }
+            
+            // 5. Проверяем наличие скрытого контента который должен быть виден
+            const hiddenContent = document.querySelector('[class*="hidden" i], [aria-hidden="true"]');
+            if (hiddenContent) {
+                // Проверяем не является ли это ожидаемым состоянием
+                const expectedHidden = ['cookie', 'modal', 'popup', 'overlay'];
+                const hiddenClass = typeof hiddenContent.className === 'string'
+                    ? hiddenContent.className.toLowerCase()
+                    : String(hiddenContent.getAttribute('class') || '').toLowerCase();
+                if (!expectedHidden.some(h => hiddenClass.includes(h))) {
+                    // Возможно контент должен быть виден
+                    result.details.potentially_hidden = true;
+                }
+            }
+            
+            return result;
+        }""")
+        
+        if stuck_info.get('is_stuck'):
+            log_func(f"Stuck state: reason={stuck_info['reason']}, suggestion={stuck_info['suggestion']}")
+        
+        return stuck_info
+        
+    except Exception as e:
+        log_func(f"Stuck state detection: ошибка: {str(e)[:80]}")
+        return {"is_stuck": False, "reason": "error", "suggestion": None}
+
+DEBUG_CLASSIFY = True
+WORKOUT_ISSUES_STEP_KEY = "stepid=step-workout-issues"
+WORKOUT_FREQUENCY_STEP_KEY = "stepid=step-workout-frequency"
+DATE_OF_BIRTH_STEP_KEY = "stepid=step-date-of-birth"
+
+
+PAYWALL_URL_KEYWORDS = [
+    "payment",
+    "paywall",
+    "pricing",
+    "subscription",
+    "subscribe",
+    "plans",
+    "premium",
+    "membership",
+    "checkout",
+    "billing",
+    "purchase",
+    "upgrade",
+    "trial",
+]
+
+PAYWALL_PLAN_KEYWORDS = [
+    "pricing",
+    "plans",
+    "subscription",
+    "subscribe",
+    "premium",
+    "membership",
+    "membership plan",
+    "subscription plan",
+    "choose your plan",
+    "select your plan",
+    "upgrade plan",
+    "monthly",
+    "annual",
+    "yearly",
+    "weekly",
+    "starter",
+    "basic",
+    "pro",
+    "premium plan",
+    "best value",
+    "most popular",
+    "unlimited access",
+    "premium access",
+    "premium membership",
+    "premium plan",
+]
+
+PAYWALL_CTA_KEYWORDS = [
+    "subscribe",
+    "start trial",
+    "free trial",
+    "try free",
+    "continue with plan",
+    "choose plan",
+    "select plan",
+    "view plans",
+    "upgrade now",
+    "upgrade to premium",
+    "get premium",
+    "buy now",
+    "purchase",
+    "checkout",
+    "unlock now",
+    "get access",
+    "continue to checkout",
+    "start subscription",
+    "start membership",
+]
+
+PAYWALL_LIMITATION_KEYWORDS = [
+    "limited access",
+    "unlock full access",
+    "unlock premium",
+    "continue reading",
+    "members only",
+    "subscriber-only",
+    "subscription required",
+    "access denied",
+    "to continue",
+    "get unlimited access",
+    "full access",
+    "buy access",
+    "unlock your plan",
+    "unlock premium results",
+    "upgrade to continue",
+    "available on premium",
+    "premium only",
+    "members only",
+]
+
+PAYWALL_TRIAL_KEYWORDS = [
+    "trial",
+    "free trial",
+    "start your trial",
+    "start free trial",
+    "7-day trial",
+    "3-day trial",
+    "cancel anytime",
+    "billed",
+    "per week",
+    "per month",
+    "per year",
+]
+
+PAYWALL_COMPARISON_KEYWORDS = [
+    "compare plans",
+    "plan comparison",
+    "what's included",
+    "features included",
+    "choose the plan",
+    "select the plan",
+    "most popular",
+    "best deal",
+    "best value",
+    "save ",
+]
+
+PAYWALL_BILLING_KEYWORDS = [
+    "billed",
+    "billing",
+    "renews",
+    "auto-renew",
+    "recurring",
+    "charged",
+    "payment method",
+    "credit card",
+    "card details",
+    "secure checkout",
+    "order summary",
+    "purchase summary",
+    "cancel anytime",
+    "after trial",
+    "today only",
+]
+
+PAYWALL_ACCESS_KEYWORDS = [
+    "unlock access",
+    "unlock premium",
+    "full access",
+    "premium access",
+    "members area",
+    "subscriber-only",
+    "subscription required",
+    "continue with subscription",
+    "upgrade to continue",
+    "access all content",
+]
+
+PAYWALL_NEGATIVE_KEYWORDS = [
+    "income",
+    "revenue",
+    "salary",
+    "earnings",
+    "profit",
+    "make money",
+    "how much do you earn",
+    "how much can you earn",
+    "quiz",
+    "survey",
+    "question",
+    "step",
+    "application",
+    "apply now",
+    "qualify",
+    "qualification",
+    "lead",
+    "lead form",
+    "results quiz",
+    "calculator",
+    "estimate",
+    "assessment",
+    "booking",
+    "appointment",
+    "consultation",
+    "quote",
+    "your budget",
+    "your income",
+    "monthly income",
+    "annual income",
+    "desired salary",
+]
+
+PAYWALL_CARD_BADGE_KEYWORDS = [
+    "most popular",
+    "best value",
+    "best deal",
+    "recommended",
+    "limited offer",
+    "save ",
+    "off",
+]
+
+PAYWALL_CHECKOUT_KEYWORDS = [
+    "checkout",
+    "secure checkout",
+    "payment method",
+    "card details",
+    "order summary",
+    "purchase summary",
+    "complete purchase",
+    "confirm purchase",
+    "confirm subscription",
+]
+
+PAYWALL_PRICE_PATTERN = re.compile(
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))"
+)
+
+PAYWALL_PRICE_CONTEXT_PATTERN = re.compile(
+    r"(?:"
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))"
+    r"[^\n]{0,40}(?:/\s*(?:week|month|year)|per\s+(?:week|month|year)|monthly|yearly|weekly|billed|billing|trial|plan|subscription|membership)"
+    r"|"
+    r"(?:plan|subscription|membership|premium|trial|billing|billed|checkout|upgrade|subscribe)"
+    r"[^\n]{0,40}(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))"
+    r")"
+)
+
+PAYWALL_PERIODIC_PRICE_PATTERN = re.compile(
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))\s*(?:/\s*(?:week|month|year)|per\s+(?:week|month|year))"
+)
+
+PAYWALL_RANGE_PRICE_PATTERN = re.compile(
+    r"\b\d{1,4}\s*(?:-|–|to)\s*\d{1,4}\s*(?:k|m|тыс\.?|тысяч)?\s*(?:[$€£₽]|usd|eur|gbp|rub)?\b"
+)
+
+PAYWALL_PLAN_DURATION_PATTERN = re.compile(
+    r"\b\d{1,2}\s*[- ]?(?:day|week|month|year)s?\s+plan\b|\b(?:weekly|monthly|yearly|annual)\s+plan\b"
+)
+
+PAYWALL_DISCOUNT_PATTERN = re.compile(
+    r"\b(?:save|off)\s*\d{1,3}%\b|\b\d{1,3}%\s*off\b"
+)
+
+PAYWALL_MULTI_PRICE_CLUSTER_PATTERN = re.compile(
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))(?:[^\n]{0,24}(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:usd|eur|gbp|rub|₽|\$|€|£))){1,}"
+)
+
+
+def _keyword_hits(text: str, keywords: list[str]) -> list[str]:
+    return [keyword for keyword in keywords if keyword in text]
+
+
+def _count_plan_option_titles(text: str) -> int:
+    option_groups = [
+        ["basic", "pro", "premium"],
+        ["monthly", "annual", "yearly"],
+        ["starter", "pro", "enterprise"],
+    ]
+    best = 0
+    for group in option_groups:
+        hits = sum(1 for item in group if item in text)
+        best = max(best, hits)
+    return best
+
+
+def _has_multiple_prices(text: str) -> bool:
+    prices = PAYWALL_PRICE_PATTERN.findall(text)
+    unique_prices = {price.strip() for price in prices if str(price).strip()}
+    return len(unique_prices) >= 2
+
+
+def _has_price_in_paywall_context(text: str) -> bool:
+    return bool(PAYWALL_PRICE_CONTEXT_PATTERN.search(text) or PAYWALL_PERIODIC_PRICE_PATTERN.search(text))
+
+
+def _has_quiz_money_context(text: str) -> bool:
+    if not PAYWALL_PRICE_PATTERN.search(text):
+        return False
+    if PAYWALL_RANGE_PRICE_PATTERN.search(text):
+        return True
+    negative_hits = _keyword_hits(text, PAYWALL_NEGATIVE_KEYWORDS)
+    money_hits = _keyword_hits(text, ["income", "revenue", "salary", "earnings", "profit", "budget"])
+    return len(negative_hits) >= 2 or bool(money_hits)
+
+
+def _count_commercial_price_signals(text: str) -> int:
+    score = 0
+    if PAYWALL_PERIODIC_PRICE_PATTERN.search(text):
+        score += 2
+    if PAYWALL_PLAN_DURATION_PATTERN.search(text):
+        score += 2
+    if PAYWALL_DISCOUNT_PATTERN.search(text):
+        score += 2
+    if PAYWALL_MULTI_PRICE_CLUSTER_PATTERN.search(text):
+        score += 2
+    if len(_keyword_hits(text, PAYWALL_CARD_BADGE_KEYWORDS)) >= 1:
+        score += 1
+    return score
+
+
+def is_probable_paywall_url(url: str) -> bool:
+    try:
+        u = (url or "").lower()
+        parsed = urlparse(u)
+        combined = " ".join([
+            parsed.netloc or "",
+            parsed.path or "",
+            parsed.query or "",
+            parsed.fragment or "",
+        ])
+        strong_url_hits = sum(1 for keyword in PAYWALL_URL_KEYWORDS if keyword in combined)
+        return strong_url_hits >= 1
+    except:
+        return False
+
+
+def detect_paywall_signals(page: Page) -> tuple[bool, str]:
+    try:
+        text = page.evaluate("() => (document.body.innerText || '').toLowerCase()") or ""
+    except:
+        text = ""
+
+    url = (page.url or "").lower()
+    url_has_paywall_keyword = is_probable_paywall_url(url)
+
+    plan_hits = _keyword_hits(text, PAYWALL_PLAN_KEYWORDS)
+    cta_hits = _keyword_hits(text, PAYWALL_CTA_KEYWORDS)
+    limitation_hits = _keyword_hits(text, PAYWALL_LIMITATION_KEYWORDS)
+    trial_hits = _keyword_hits(text, PAYWALL_TRIAL_KEYWORDS)
+    comparison_hits = _keyword_hits(text, PAYWALL_COMPARISON_KEYWORDS)
+    billing_hits = _keyword_hits(text, PAYWALL_BILLING_KEYWORDS)
+    access_hits = _keyword_hits(text, PAYWALL_ACCESS_KEYWORDS)
+    negative_hits = _keyword_hits(text, PAYWALL_NEGATIVE_KEYWORDS)
+    badge_hits = _keyword_hits(text, PAYWALL_CARD_BADGE_KEYWORDS)
+    checkout_hits = _keyword_hits(text, PAYWALL_CHECKOUT_KEYWORDS)
+
+    has_price_symbol = any(symbol in text for symbol in ["$", "€", "£", "₽"])
+    has_price_amount = bool(PAYWALL_PRICE_PATTERN.search(text))
+    has_price = has_price_symbol or has_price_amount
+    has_multiple_prices = _has_multiple_prices(text)
+    has_price_context = _has_price_in_paywall_context(text)
+    has_periodic_price = bool(PAYWALL_PERIODIC_PRICE_PATTERN.search(text))
+    has_quiz_money_context = _has_quiz_money_context(text)
+    plan_option_count = _count_plan_option_titles(text)
+    commercial_price_score = _count_commercial_price_signals(text)
+    has_discount_signal = bool(PAYWALL_DISCOUNT_PATTERN.search(text))
+    has_plan_duration = bool(PAYWALL_PLAN_DURATION_PATTERN.search(text))
+    has_multi_price_cluster = bool(PAYWALL_MULTI_PRICE_CLUSTER_PATTERN.search(text))
+
+    has_plan_offer = len(plan_hits) >= 2 or plan_option_count >= 2
+    has_subscription_cta = len(cta_hits) >= 2 or (len(cta_hits) >= 1 and (has_price_context or len(billing_hits) >= 1))
+    has_content_gating = len(limitation_hits) >= 1 or len(access_hits) >= 2
+    has_trial_offer = len(trial_hits) >= 2 or (len(trial_hits) >= 1 and len(billing_hits) >= 1)
+    has_plan_comparison = len(comparison_hits) >= 1 and (plan_option_count >= 2 or has_multiple_prices)
+    has_billing_context = len(billing_hits) >= 2 or has_periodic_price
+    has_checkout_context = len(checkout_hits) >= 1
+    has_pricing_cards = (
+        (has_multiple_prices or has_multi_price_cluster)
+        and (has_plan_offer or has_plan_duration or len(badge_hits) >= 1)
+    )
+
+    strong_signals = 0
+    if has_plan_offer and (has_multiple_prices or has_plan_comparison):
+        strong_signals += 1
+    if has_billing_context and has_price_context:
+        strong_signals += 1
+    if has_content_gating and (has_subscription_cta or has_trial_offer or has_plan_offer):
+        strong_signals += 1
+    if has_checkout_context and has_price_context:
+        strong_signals += 1
+    if has_trial_offer and has_billing_context:
+        strong_signals += 1
+    if has_pricing_cards and commercial_price_score >= 3:
+        strong_signals += 1
+    if url_has_paywall_keyword and (has_pricing_cards or has_checkout_context or has_billing_context):
+        strong_signals += 1
+
+    weak_signals = 0
+    if url_has_paywall_keyword:
+        weak_signals += 1
+    if has_plan_offer:
+        weak_signals += 1
+    if has_subscription_cta:
+        weak_signals += 1
+    if has_content_gating:
+        weak_signals += 1
+    if has_trial_offer:
+        weak_signals += 1
+    if has_plan_comparison:
+        weak_signals += 1
+    if has_billing_context:
+        weak_signals += 1
+    if has_checkout_context:
+        weak_signals += 1
+    if has_price_context:
+        weak_signals += 1
+    if has_pricing_cards:
+        weak_signals += 1
+    if commercial_price_score >= 2:
+        weak_signals += 1
+
+    if has_quiz_money_context and strong_signals < 2 and commercial_price_score < 3:
+        return False, "Money-related quiz/leadgen context detected without enough subscription evidence"
+
+    if len(negative_hits) >= 3 and strong_signals < 2 and commercial_price_score < 3:
+        return False, "Quiz/leadgen anti-signals outweigh weak pricing indicators"
+
+    if has_price and not (has_price_context or has_billing_context or has_plan_comparison):
+        return False, "Standalone prices or money amounts without billing/subscription context"
+
+    if url_has_paywall_keyword and has_pricing_cards and (has_price_context or commercial_price_score >= 3):
+        return True, "Payment-like URL combined with pricing-card paywall content"
+
+    if has_pricing_cards and has_price_context and (has_subscription_cta or has_billing_context or has_discount_signal):
+        return True, "Pricing cards with commercial price context and subscription/discount signals detected"
+
+    if has_multi_price_cluster and has_plan_duration and (len(badge_hits) >= 1 or has_discount_signal or url_has_paywall_keyword):
+        return True, "Multiple plan prices with duration and badge/discount signals detected"
+
+    if url_has_paywall_keyword and strong_signals >= 2:
+        return True, "Strong paywall URL combined with multiple independent paywall signals"
+
+    if has_checkout_context and has_billing_context and has_price_context:
+        return True, "Checkout flow with billing and price context detected"
+
+    if has_content_gating and has_plan_offer and (has_billing_context or has_trial_offer or has_plan_comparison):
+        return True, "Content gating combined with plan selection and billing/trial context"
+
+    if has_plan_offer and has_plan_comparison and has_price_context and (has_billing_context or has_subscription_cta):
+        return True, "Multiple plan options with pricing and billing/CTA context detected"
+
+    if has_trial_offer and has_price_context and has_billing_context and (has_content_gating or has_plan_offer or has_subscription_cta):
+        return True, "Trial with billing commitment and subscription context detected"
+
+    if strong_signals >= 3 and weak_signals >= 4:
+        return True, "Several strong paywall indicators detected together"
+
+    return False, "No reliable paywall signals detected"
+
+
+def resolve_fill_values(config: dict) -> dict:
+    runner_cfg = config.get("runner", {}) if isinstance(config.get("runner"), dict) else {}
+    fill = config.get("fill_values", {}) or runner_cfg.get("fill_values", {}) or {}
+    email_value = str(fill.get("email", "")).strip()
+    if not email_value:
+        natural_local = f"alexey.quiz{datetime.now().strftime('%m%d')}"
+        email_value = f"{natural_local}@gmail.com"
+    return {
+        "name": str(fill.get("name", "John")),
+        "email": email_value,
+        "age": str(fill.get("age", "30")),
+        "height": str(fill.get("height", "170")),
+        "weight": str(fill.get("weight", "70")),
+        "goal_weight": str(fill.get("goal_weight", "60")),
+        "default_number": str(fill.get("default_number", "25")),
+        "date_of_birth": str(fill.get("date_of_birth", "01/01/1990")),
+    }
+
+
+def has_meaningful_progress(start_url: str, end_url: str, start_hash: str, end_hash: str, ui_before: str, ui_after: str) -> bool:
+    if (end_url or "") != (start_url or ""):
+        return True
+    if (end_hash or "") != (start_hash or ""):
+        return True
+    if (ui_before or "") != (ui_after or "") and (ui_after or "") != "unknown":
+        return True
+    return False
+
+
+def warmup_page_for_full_screenshot(page: Page, log_func) -> None:
+    try:
+        total_h = page.evaluate(
+            "() => Math.max(document.body.scrollHeight || 0, document.documentElement.scrollHeight || 0)"
+        ) or 0
+        viewport_h = page.evaluate("() => window.innerHeight || 800") or 800
+        if total_h <= viewport_h:
+            return
+
+        step = max(int(viewport_h * 0.85), 280)
+        pos = 0
+        while pos < total_h - viewport_h:
+            pos = min(pos + step, total_h - viewport_h)
+            page.evaluate("(y) => window.scrollTo(0, y)", pos)
+            time.sleep(0.25)
+
+        # Give lazy blocks/images a moment to load at the bottom.
+        time.sleep(1.2)
+        log_func("Подготовка скриншота: выполнена прокрутка страницы для догрузки контента")
+    except Exception as e:
+        log_func(f"Не удалось подготовить полный скриншот: {str(e)[:90]}")
+
+
+def ensure_paywall_plans_marker(page: Page, log_func) -> bool:
+    try:
+        marked = page.evaluate(r"""() => {
+            const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const priceRe = /(?:[$€£₽]\s?\d|\d\s?(?:usd|eur|gbp|rub|₽|\$|€|£)|\b\d+[.,]?\d*\s*\/(?:mo|month|year|yr|week)\b)/i;
+            const planTerms = ['plan', 'pricing', 'subscription', 'premium', 'membership', 'billing', 'monthly', 'yearly', 'annual', 'per month', 'per year', 'week', 'month', 'year', 'trial'];
+            const isVisible = (el) => {
+                if (!el || !el.isConnected) return false;
+                const style = window.getComputedStyle(el);
+                if (!style || style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') < 0.05) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width >= 120 && rect.height >= 80;
+            };
+            const textOf = (el) => normalize([
+                el.innerText || '',
+                el.textContent || '',
+                el.getAttribute('aria-label') || '',
+                el.getAttribute('data-testid') || ''
+            ].join(' '));
+
+            document.querySelectorAll('.paywall_plans').forEach(el => el.classList.remove('paywall_plans'));
+
+            let best = null;
+            let bestScore = -1;
+            const nodes = Array.from(document.querySelectorAll('section, div, main, article, form'));
+            for (const el of nodes) {
+                if (!isVisible(el)) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < Math.min(window.innerWidth * 0.45, 260) || rect.height < 120) continue;
+                const text = textOf(el);
+                if (!text) continue;
+
+                let score = 0;
+                if (priceRe.test(text)) score += 4;
+                for (const term of planTerms) {
+                    if (text.includes(term)) score += 1;
+                }
+
+                const children = Array.from(el.children || []).filter(isVisible);
+                const priceChildren = children.filter(child => priceRe.test(textOf(child))).length;
+                const ctaChildren = children.filter(child => /continue|choose|select|get started|buy|subscribe|start/i.test(textOf(child))).length;
+                if (priceChildren >= 2) score += 6;
+                if (ctaChildren >= 1) score += 2;
+                if (children.length >= 2 && children.length <= 12) score += 1;
+                if (rect.top >= 0 && rect.top < window.innerHeight) score += 1;
+
+                if (score > bestScore) {
+                    best = el;
+                    bestScore = score;
+                }
+            }
+
+            if (!best || bestScore < 6) return false;
+            best.classList.add('paywall_plans');
+            best.setAttribute('data-paywall-plans-score', String(bestScore));
+            return true;
+        }""")
+        if marked:
+            log_func("Paywall plans: контейнер тарифов промаркирован классом paywall_plans")
+        return bool(marked)
+    except Exception as e:
+        log_func(f"Paywall plans: не удалось промаркировать контейнер: {str(e)[:90]}")
+        return False
+
+
+def save_paywall_plans_screenshot(page: Page, full_screenshot_path: str, plans_screenshot_path: str, log_func) -> bool:
+    try:
+        for attempt in range(4):
+            ensure_paywall_plans_marker(page, log_func)
+            locator = page.locator(".paywall_plans").first
+            if locator.count() > 0:
+                try:
+                    locator.scroll_into_view_if_needed(timeout=2500)
+                except Exception:
+                    pass
+                time.sleep(0.35)
+                try:
+                    if locator.is_visible(timeout=1500):
+                        locator.screenshot(path=plans_screenshot_path, timeout=4000)
+                        log_func(f"Paywall plans: сохранен скриншот блока тарифов: {plans_screenshot_path}")
+                        return True
+                except Exception as direct_error:
+                    log_func(f"Paywall plans: element screenshot не удался, пробую fallback: {str(direct_error)[:90]}")
+                    try:
+                        box = locator.bounding_box()
+                    except Exception:
+                        box = None
+                    if box and box.get("width", 0) > 10 and box.get("height", 0) > 10:
+                        clip = {
+                            "x": max(0, float(box.get("x", 0))),
+                            "y": max(0, float(box.get("y", 0))),
+                            "width": max(1, float(box.get("width", 0))),
+                            "height": max(1, float(box.get("height", 0))),
+                        }
+                        page.screenshot(path=plans_screenshot_path, clip=clip)
+                        log_func(f"Paywall plans: сохранен clip fallback блока тарифов: {plans_screenshot_path}")
+                        return True
+            time.sleep(0.5 + attempt * 0.25)
+        log_func(f"Paywall plans: блок тарифов не найден, сохранен только полный paywall screenshot: {full_screenshot_path}")
+        return False
+    except Exception as e:
+        log_func(f"Paywall plans: ошибка сохранения скриншота тарифов: {str(e)[:120]}")
+        return False
+
+def classify_screen(page: Page, log_func):
+    def debug_return(ctype, reason):
+        if DEBUG_CLASSIFY:
+            log_func(f"Причина классификации={reason}")
+        return ctype
+
+    t = ""
+    try: t = page.evaluate("() => (document.body.innerText || '').toLowerCase()")
+    except: pass
+    u = page.url.lower()
+    
+    # 1. Checkout
+    checkout_kws = ["card number", "cvv", "mm/yy", "confirm payment", "paypal", "buy now"]
+    if any(k in t for k in checkout_kws) or page.locator("input[name*='card']").count() > 0:
+        return debug_return('checkout', "Checkout keywords or card inputs found")
+
+    # 2. Paywall
+    is_paywall, paywall_reason = detect_paywall_signals(page)
+    is_madmuscles_final_url = "madmuscles.com/final/" in u
+    if (
+        ("coursiv.io" in u and "selling-page" in u)
+        or is_paywall
+        or is_madmuscles_final_url
+    ):
+        return debug_return('paywall', paywall_reason)
+
+    # 3. Game/Prize/Spin screens (should be info)
+    game_kws = ["spin", "wheel", "prize"]
+    if any(k in t for k in game_kws) or "prize-wheel" in u:
+        # Check if there is an actual SPIN button
+        btn_text = (page.evaluate("() => Array.from(document.querySelectorAll('button, a, [role=\"button\"]')).map(el => el.innerText).join(' ')") or "").lower()
+        if any(k in btn_text for k in game_kws) or "prize-wheel" in u:
+            return debug_return('info', "Game/Prize screen detected (keyword in buttons/URL)")
+
+    # 4. Email
+    email_step_signals = ["/email", "step=email", "email-step", "auth-capture", "enter-email"]
+    name_step_signals = ["what's your name", "what is your name", "your name", "full name", "first name"]
+    has_email_input = page.locator("input[type='email'], input[autocomplete*='email' i]").count() > 0
+    if not has_email_input:
+        inputs = page.locator("input:not([type='hidden'])")
+        inputs_count = inputs.count()
+        for i in range(inputs_count):
+            try:
+                p = (inputs.nth(i).get_attribute("placeholder") or "").lower()
+                if any(k in p for k in ["email", "e-mail", "mail@"]): has_email_input = True; break
+            except: pass
+
+    # If attributes are not enough, check if there is a genuinely fillable visible input AND email keywords.
+    if not has_email_input and page.locator(FILLABLE_INPUT_SELECTOR).count() > 0:
+        if any(k in t for k in ["email", "e-mail", "СЌР»РµРєС‚СЂРѕРЅРЅР°СЏ РїРѕС‡С‚Р°", "Р°РґСЂРµСЃ РїРѕС‡С‚С‹"]):
+            # Only if it's not a profile data screen (age, weight, etc.)
+            pd_kws = ["age", "height", "weight", "name", "СЂРѕСЃС‚", "РІРµСЃ", "РІРѕР·СЂР°СЃС‚", "РёРјСЏ"]
+            if not any(k in t for k in pd_kws):
+                has_email_input = True
+
+    if not has_email_input and page.locator(FILLABLE_INPUT_SELECTOR).count() == 1:
+        try:
+            only_input = page.locator(FILLABLE_INPUT_SELECTOR).first
+            input_hints = " ".join([
+                (only_input.get_attribute("placeholder") or ""),
+                (only_input.get_attribute("name") or ""),
+                (only_input.get_attribute("id") or ""),
+                (only_input.get_attribute("autocomplete") or ""),
+                (only_input.get_attribute("aria-label") or ""),
+                (only_input.get_attribute("data-testid") or ""),
+            ]).lower()
+            email_like_text = any(k in t for k in ["email", "e-mail", "enter your email", "your email", "work email"])
+            email_like_url = any(k in u for k in email_step_signals)
+            email_like_input = any(k in input_hints for k in ["email", "e-mail", "mail"])
+            name_like_text = any(k in t for k in name_step_signals)
+            name_like_input = any(k in input_hints for k in ["name", "full-name", "fullname", "first-name", "firstname"])
+            if (email_like_text or email_like_url or email_like_input) and not (name_like_text or name_like_input):
+                has_email_input = True
+        except:
+            pass
+
+    if has_email_input:
+        try:
+            visible_email_like = page.evaluate(
+                "() => {\n"
+                + _js_interaction_helpers()
+                + "const nodes = Array.from(document.querySelectorAll('input, textarea'));\n"
+                + "return nodes.some(el => {\n"
+                + "  if (!isElementVisible(el) || isDisabledElement(el)) return false;\n"
+                + "  const type = normalizeText(el.getAttribute('type') || '');\n"
+                + "  const hints = getElementText(el);\n"
+                + "  if (type === 'email') return true;\n"
+                + "  return ['email', 'e-mail', 'mail@'].some(k => hints.includes(k));\n"
+                + "});\n"
+                + "}"
+            )
+            if not visible_email_like:
+                has_email_input = False
+        except:
+            pass
+
+    if has_email_input: return debug_return('email', "Email field found via attributes or text")
+
+    # 4. Input (with animation safety)
+    pd_kws = ["age", "height", "weight", "name", "cm", "kg", "years", "call you"]
+    if any(k in t for k in pd_kws) or any(k in u for k in ["name", "age", "weight", "height"]):
+        try: page.wait_for_selector(FILLABLE_INPUT_SELECTOR, timeout=2000)
+        except: pass
+    
+    inputs = page.locator(FILLABLE_INPUT_SELECTOR)
+    if inputs.count() >= 1: return debug_return('input', f"{inputs.count()} input(s) found")
+
+    # 4.5 Email Consent / Notifications (Should be question)
+    consent_kws = ["receive emails", "send me emails", "notifications", "updates", "stay in the loop", "newsletters", "consent", "i'm in"]
+    if any(k in t for k in consent_kws) and ("email" in t or "mail" in t or "email-page" in u):
+        return debug_return('question', "Email consent/notification screen detected")
+
+    # 5. Question vs Info (Smart separation)
+    nav_words = [
+        "next", "continue", "skip", "back", "weiter", "zurГјck", "next step", "proceed", 
+        "got it", "ok", "okay", "great", "understood", "yes", "i'm in", "let's go", 
+        "see results", "start", "РїСЂРёРЅСЏС‚СЊ", "РѕРє", "РЅР°С‡Р°С‚СЊ", "РїРѕРЅСЏС‚РЅРѕ", "С…РѕСЂРѕС€Рѕ",
+        "do it", "ready", "begin", "let's", "go", "transformation", "continuar", "siguiente"
+    ]
+    
+    # Get all potential interactive elements
+    raw_els = page.locator("[data-testid*='answer' i]:visible, [class*='Card' i]:not([class*='testimonial' i]):not([class*='review' i]):visible, [class*='button' i]:visible, [class*='btn' i]:visible, label:visible, button:visible, a:visible, [role='button']:visible, div[role='button']:visible")
+    
+    choices = []
+    nav_btns = []
+    
+    raw_count = raw_els.count()
+    for i in range(raw_count):
+        el = raw_els.nth(i)
+        if is_forbidden_button(el, log_func): continue
+
+        # Verify it's genuinely interactive
+        is_int = el.evaluate("""el => {
+            const t = el.tagName.toLowerCase();
+            if (t === 'button' || t === 'a' || t === 'label' || t === 'input') return true;
+            if (el.getAttribute('role') === 'button') return true;
+            return window.getComputedStyle(el).cursor === 'pointer';
+        }""")
+        if not is_int: continue
+
+        txt = safe_inner_text(el, "").lower().strip()
+        
+        if not txt:
+            tag = el.evaluate("el => el.tagName").lower()
+            if tag in ['button', 'label', 'input']:
+                choices.append("empty_choice")
+            continue
+
+        is_nav = False
+        for w in nav_words:
+            if txt == w or txt.startswith(w + "!") or txt.startswith(w + ".") or (len(txt) < 20 and w in txt):
+                is_nav = True
+                break
+        
+        if is_nav:
+            nav_btns.append(txt)
+        else:
+            choices.append(txt)
+
+    total_interactive = len(choices) + len(nav_btns)
+
+    has_skip = any("skip" in b for b in nav_btns)
+    has_picker = False
+    try:
+        has_picker = page.locator("select:visible, [role='combobox']:visible, [role='listbox']:visible, [role='slider']:visible, [class*='picker' i]:visible").count() > 0
+    except: pass
+
+    # Core Logic based on exact number of interactive options
+    if total_interactive == 0:
+        return debug_return('other', "No clear type detected")
+        
+    if total_interactive == 1:
+        if has_picker:
+            return debug_return('question', "Single CTA but custom picker/selector found")
+        # Only one available action option
+        return debug_return('info', "Single interactive element detected, classifying as info")
+        
+    if total_interactive >= 2:
+        # Two or more explicit interactive options
+        if len(choices) >= 1 or has_skip or has_picker:
+            # If at least one of them is a choice, or it has a skip button/picker, it's a question
+            return debug_return('question', f"Multiple options detected ({total_interactive}), including choices/skip/picker")
+        else:
+            # Multiple nav buttons but no explicit choices (e.g., 'Back' and 'Next') -> Info
+            return debug_return('info', f"Multiple nav buttons ({total_interactive}) but no choices, classifying as info")
+
+    return debug_return('other', "No clear type detected")
+
+
+def find_continue_button(page: Page, log_func=None):
+    try:
+        page.evaluate("""() => document.querySelectorAll('[data-qfr-continue-best]').forEach(el => el.removeAttribute('data-qfr-continue-best'))""")
+        script = (
+            "() => {\n"
+            + _js_interaction_helpers()
+            + f"const positive = {json.dumps([k.lower() for k in ACTION_KEYWORDS])};\n"
+            + f"const negative = {json.dumps(QUESTION_NEGATIVE_TERMS)};\n"
+            + "const nodes = Array.from(document.querySelectorAll(\"button, [role='button'], a, input[type='submit'], input[type='button'], div, span\"));\n"
+            + "let best = null; let bestScore = -1;\n"
+            + "for (const el of nodes) {\n"
+            + "  if (!isElementVisible(el) || !isProbablyClickable(el) || isDisabledElement(el)) continue;\n"
+            + "  const text = getElementText(el);\n"
+            + "  if (!text || text.length > 180) continue;\n"
+            + "  if (negative.some(term => text.includes(term))) continue;\n"
+            + "  if (!positive.some(term => text.includes(term))) continue;\n"
+            + "  const rect = el.getBoundingClientRect();\n"
+            + "  const style = window.getComputedStyle(el);\n"
+            + "  let score = 70;\n"
+            + "  if ((el.tagName || '').toLowerCase() === 'button') score += 20;\n"
+            + "  if (normalizeText(el.getAttribute('role') || '') === 'button') score += 15;\n"
+            + "  if ((el.tagName || '').toLowerCase() === 'input') score += 14;\n"
+            + "  if (style.cursor === 'pointer') score += 8;\n"
+            + "  if (viewportRatio(rect) >= 0.95) score += 18; else if (viewportRatio(rect) >= 0.6) score += 10;\n"
+            + "  if (isTopMostForClick(el)) score += 30; else score -= 60;\n"
+            + "  if (rect.top >= 0 && rect.bottom <= window.innerHeight) score += 10;\n"
+            + "  if (text === 'continue' || text === 'next' || text === 'submit' || text === 'continuar') score += 12;\n"
+            + "  if (text.includes('verify') || text.includes('confirm')) score += 12;\n"
+            + "  if (text.includes('get started') || text.includes('start')) score += 8;\n"
+            + "  if ((el.closest('form') || null)) score += 6;\n"
+            + "  if (rect.width >= 44 && rect.height >= 32) score += 6;\n"
+            + "  if (rect.width < 24 || rect.height < 24) score -= 40;\n"
+            + "  if (score > bestScore) { bestScore = score; best = el; }\n"
+            + "}\n"
+            + "if (!best) return false;\n"
+            + "best.setAttribute('data-qfr-continue-best', '1');\n"
+            + "return true;\n"
+            + "}"
+        )
+        if page.evaluate(script):
+            btn = page.locator("[data-qfr-continue-best='1']").first
+            if btn.count() > 0 and not is_forbidden_button(btn, log_func):
+                return btn
+    except:
+        pass
+    return None
+
+
+def try_click_continue_js(page: Page, log_func) -> bool:
+    """
+    Универсальный JS fallback для клика по CTA-кнопке продолжения.
+    Полезно для кастомных div-кнопок (React/Next), где нет <button>.
+    """
+    try:
+        script = (
+            "() => {\n"
+            + _js_interaction_helpers()
+            + f"const positive = {json.dumps([k.lower() for k in ACTION_KEYWORDS])};\n"
+            + f"const negative = {json.dumps(QUESTION_NEGATIVE_TERMS)};\n"
+            + "const candidates = Array.from(document.querySelectorAll(\"button, [role='button'], a, input[type='submit'], input[type='button'], div, span\"));\n"
+            + "let best = null; let bestScore = -1;\n"
+            + "for (const el of candidates) {\n"
+            + "  if (!isElementVisible(el) || isDisabledElement(el) || !isProbablyClickable(el)) continue;\n"
+            + "  const txt = getElementText(el);\n"
+            + "  if (!txt || txt.length > 180) continue;\n"
+            + "  if (negative.some(k => txt.includes(k))) continue;\n"
+            + "  if (!positive.some(k => txt.includes(k))) continue;\n"
+            + "  const st = window.getComputedStyle(el);\n"
+            + "  const r = el.getBoundingClientRect();\n"
+            + "  let score = 60;\n"
+            + "  if ((el.tagName || '').toLowerCase() === 'button') score += 22;\n"
+            + "  if (normalizeText(el.getAttribute('role') || '') === 'button') score += 15;\n"
+            + "  if (st.cursor === 'pointer') score += 8;\n"
+            + "  if (viewportRatio(r) >= 0.95) score += 20;\n"
+            + "  if (isTopMostForClick(el)) score += 25; else score -= 60;\n"
+            + "  if (r.top > window.innerHeight * 0.45) score += 10;\n"
+            + "  if (txt === 'continue' || txt === 'next' || txt === 'continuar') score += 10;\n"
+            + "  if ((el.closest('form') || null)) score += 6;\n"
+            + "  if (score > bestScore) { bestScore = score; best = { el, txt }; }\n"
+            + "}\n"
+            + "if (!best) return { clicked: false, text: null };\n"
+            + "return { clicked: clickElementReliably(best.el), text: best.txt || null };\n"
+            + "}"
+        )
+        result = page.evaluate(script)
+        if result and result.get("clicked"):
+            log_func(f"JS CTA fallback: клик по кнопке '{(result.get('text') or '').strip()[:50]}'")
+            return True
+    except Exception as e:
+        log_func(f"JS CTA fallback: ошибка: {str(e)[:80]}")
+    return False
+
+
+def try_click_question_option_js(page: Page, log_func, repeat_attempt: int = 0, prefer_skip: bool = False) -> bool:
+    """
+    Универсальный JS fallback для экранов-вопросов.
+    Ищет не CTA, а именно вероятные варианты ответа, включая кастомные кнопки
+    без текста (например, иконки/числовые value/карточки со SVG).
+    """
+    try:
+        negatives = QUESTION_NEGATIVE_TERMS + ['continue', 'next', 'start', 'submit', 'got it', "let's do it", 'let’s do it', 'contact us']
+        script = (
+            "(params) => {\n"
+            + _js_interaction_helpers()
+            + f"const negative = {json.dumps(negatives)};\n"
+            + "const repeatAttempt = params.repeatAttempt || 0;\n"
+            + "const preferSkip = !!params.preferSkip;\n"
+            + "const skipTexts = ['skip this question', 'skip question', 'skip this step', 'skip step', 'skip for now', 'skip', 'not sure yet', 'decide later'];\n"
+            + "const candidates = Array.from(document.querySelectorAll(\"button, [role='button'], label, [data-testid], [class], li, div\"));\n"
+            + "const scored = [];\n"
+            + "for (let i = 0; i < candidates.length; i++) {\n"
+            + "  const el = candidates[i];\n"
+            + "  if (!isElementVisible(el) || isDisabledElement(el) || !isProbablyClickable(el)) continue;\n"
+            + "  const rect = el.getBoundingClientRect();\n"
+            + "  const style = window.getComputedStyle(el);\n"
+            + "  const text = getElementText(el);\n"
+            + "  const full = `${text} ${normalizeText(el.className || '')} ${normalizeText(el.getAttribute('data-testid') || '')}`.toLowerCase();\n"
+            + "  const isSkip = skipTexts.some(k => full.includes(k));\n"
+            + "  if (negative.some(k => full.includes(k)) && !(preferSkip && isSkip)) continue;\n"
+            + "  let score = 0;\n"
+            + "  const tag = (el.tagName || '').toLowerCase();\n"
+            + "  if (preferSkip && isSkip) score += 200;\n"
+            + "  if (tag === 'button') score += 25;\n"
+            + "  if ((el.getAttribute('role') || '').toLowerCase() === 'button') score += 15;\n"
+            + "  if (/(answer|option|choice|item|card|select)/i.test(full)) score += 40;\n"
+            + "  if (/^\\d+(\\.\\d+)?$/.test((el.getAttribute('value') || '').trim())) score += 30;\n"
+            + "  if (el.querySelector('svg, img, canvas, path')) score += 18;\n"
+            + "  if (!text || text.length <= 40) score += 10;\n"
+            + "  if (rect.width >= 36 && rect.height >= 36) score += 10;\n"
+            + "  if (style.position !== 'fixed' && style.position !== 'sticky') score += 10;\n"
+            + "  if (rect.top > 40 && rect.bottom < window.innerHeight - 20) score += 8;\n"
+            + "  if (preferSkip && isSkip && rect.top > window.innerHeight * 0.55) score += 25;\n"
+            + "  if (viewportRatio(rect) >= 0.95) score += 18; else if (viewportRatio(rect) >= 0.6) score += 8;\n"
+            + "  if (isTopMostForClick(el)) score += 28; else score -= 70;\n"
+            + "  if (/(continue|next|submit|start|get started|contact us|support|help|cookie policy)/i.test(text)) score -= 90;\n"
+            + "  if (/go to previous|previous question|previous step|back|go back|edit answer/i.test(text)) score -= 180;\n"
+            + "  if (rect.top < 90 && rect.left < 90 && rect.width <= 90 && rect.height <= 90) score -= 180;\n"
+            + "  if (el.closest('header')) score -= 220;\n"
+            + f"  if ({json.dumps(SELECT_ALL_KEYWORDS)}.some(term => text.includes(term))) score += 120;\n"
+            + "  if (text.length > 120) score -= 20;\n"
+            + "  const parent = el.parentElement;\n"
+            + "  if (parent) { const siblings = Array.from(parent.children).filter(sib => sib !== el && isElementVisible(sib)); if (siblings.length >= 2) score += 8; }\n"
+            + "  if (score < 25) continue;\n"
+            + "  scored.push({ index: i, score, text: text || (el.getAttribute('value') || '').trim() || '<icon-option>' });\n"
+            + "}\n"
+            + "if (!scored.length) return { clicked: false, text: null, count: 0 };\n"
+            + "scored.sort((a, b) => b.score - a.score || a.index - b.index);\n"
+            + "const unique = []; const seen = new Set();\n"
+            + "for (const item of scored) { const key = `${item.text}::${item.index}`; if (seen.has(key)) continue; seen.add(key); unique.push(item); }\n"
+            + "const pick = unique[Math.min(repeatAttempt, unique.length - 1)];\n"
+            + "const el = candidates[pick.index];\n"
+            + "return { clicked: clickElementReliably(el), text: pick.text || null, count: unique.length };\n"
+            + "}"
+        )
+        result = page.evaluate(script, {"repeatAttempt": repeat_attempt, "preferSkip": prefer_skip})
+        if result and result.get("clicked"):
+            log_func(
+                f"JS option fallback: клик по варианту '{(result.get('text') or '').strip()[:50]}' "
+                f"(кандидатов: {result.get('count', 0)})"
+            )
+            return True
+    except Exception as e:
+        log_func(f"JS option fallback: ошибка: {str(e)[:80]}")
+    return False
+
+
+def try_click_skip_question_js(page: Page, log_func) -> bool:
+    """
+    Универсальный fallback для шагов с явной ссылкой/кнопкой пропуска.
+    Нужен для календарей и других нестандартных шагов, где выбор может
+    зациклиться, но в UI есть безопасный выход через Skip.
+    """
+    try:
+        result = page.evaluate(r"""() => {
+            const skipTexts = [
+                'skip this question', 'skip question', 'skip this step', 'skip step',
+                'skip for now', 'skip', 'not sure yet', 'decide later'
+            ];
+
+            const isVisible = (el) => {
+                if (!el) return false;
+                const s = window.getComputedStyle(el);
+                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 10 && r.height > 10 && r.bottom > 0 && r.right > 0;
+            };
+
+            const isDisabled = (el) => {
+                const aria = (el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
+                const dis = !!el.disabled || el.hasAttribute('disabled');
+                return aria || dis;
+            };
+
+            const getText = (el) => {
+                return [
+                    (el.innerText || '').trim(),
+                    (el.getAttribute('aria-label') || '').trim(),
+                    (el.getAttribute('title') || '').trim()
+                ].filter(Boolean).join(' ').trim();
+            };
+
+            const candidates = Array.from(document.querySelectorAll("a, button, [role='button'], label, div"));
+            let best = null;
+            let bestScore = -1;
+
+            for (const el of candidates) {
+                if (!isVisible(el) || isDisabled(el)) continue;
+                const txt = getText(el).toLowerCase();
+                if (!txt) continue;
+                if (!skipTexts.some(k => txt.includes(k))) continue;
+
+                const rect = el.getBoundingClientRect();
+                let score = 0;
+                if ((el.tagName || '').toLowerCase() === 'a') score += 20;
+                if ((el.tagName || '').toLowerCase() === 'button') score += 12;
+                if ((el.getAttribute('role') || '').toLowerCase() === 'button') score += 10;
+                if (txt.includes('skip this question')) score += 50;
+                if (txt.includes('skip question')) score += 40;
+                if (txt === 'skip') score += 10;
+                if (rect.top > window.innerHeight * 0.55) score += 10;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = { el, text: txt };
+                }
+            }
+
+            if (!best) return { clicked: false, text: null };
+
+            best.el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            ['pointerdown','mousedown','mouseup','pointerup','click'].forEach(evt => {
+                try { best.el.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: window })); } catch (e) {}
+            });
+            try { best.el.click(); } catch (e) {}
+            return { clicked: true, text: best.text || null };
+        }""")
+
+        if result and result.get("clicked"):
+            log_func(f"JS skip fallback: клик по '{(result.get('text') or '').strip()[:50]}'")
+            return True
+    except Exception as e:
+        log_func(f"JS skip fallback: ошибка: {str(e)[:80]}")
+    return False
+
+
+def is_calendar_question(page: Page) -> bool:
+    try:
+        return bool(page.evaluate(r"""() => {
+            return !!document.querySelector('.react-datepicker-wrapper, .react-datepicker, [class*="datepicker" i]');
+        }"""))
+    except:
+        return False
+
+
+def has_skip_question_control(page: Page) -> bool:
+    try:
+        return bool(page.evaluate(r"""() => {
+            const skipTexts = ['skip this question', 'skip question', 'skip this step', 'skip step', 'skip for now'];
+            const nodes = Array.from(document.querySelectorAll('a, button, [role="button"], label, div, span'));
+            return nodes.some(el => {
+                const txt = [
+                    (el.innerText || '').trim(),
+                    (el.getAttribute('aria-label') || '').trim(),
+                    (el.getAttribute('title') || '').trim()
+                ].filter(Boolean).join(' ').toLowerCase();
+                return txt && skipTexts.some(k => txt.includes(k));
+            });
+        }"""))
+    except:
+        return False
+
+def wait_for_transition(page: Page, old_url: str, old_hash: str, timeout=10.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        if page.url != old_url or get_screen_hash(page) != old_hash:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def detect_url_loop(page: Page, url_history: list, log_func) -> bool:
+    """
+    Детекция циклических переходов по URL.
+    Проверяем последние 6 URL в истории.
+    
+    Returns True если обнаружен цикл
+    """
+    if len(url_history) < 6:
+        return False
+    
+    # Получаем базовые URL без query параметров для сравнения
+    def get_base_url(url):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        # Игнорируем некоторые параметры которые могут меняться
+        exclude_params = ['timestamp', 't', '_', 'rnd', 'rand']
+        query_params = parse_qs(parsed.query)
+        filtered_query = {k: v for k, v in query_params.items() if k not in exclude_params}
+        from urllib.parse import urlencode
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(filtered_query, doseq=True)}#{parsed.fragment}"
+    
+    # Проверяем последние 6 URL
+    recent = [get_base_url(u) for u in url_history[-6:]]
+    if len(set(recent)) == 1:
+        log_func(f"Detected URL loop: одинаковый URL 6 раз подряд")
+        return True
+    
+    # Проверяем паттерн A -> B -> A
+    if len(url_history) >= 2:
+        base_current = get_base_url(page.url)
+        base_prev = get_base_url(url_history[-2])
+        if base_current == base_prev:
+            log_func(f"Detected URL loop: возврат на предыдущий URL")
+            return True
+    
+    return False
+
+
+def try_click_got_it(page: Page, log_func, timeout: float = 4.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            got_it_btns = page.locator("button:visible, [role='button']:visible, a:visible").get_by_text("Got it", exact=False)
+            if got_it_btns.count() > 0:
+                btn = got_it_btns.first
+                if btn.is_enabled():
+                    log_func("Найдена подсказка MadMuscles: нажимаю Got it")
+                    pre_hash = get_screen_hash(page)
+                    btn.click(force=True, timeout=1500)
+                    moved = wait_for_transition(page, page.url, pre_hash, timeout=8.0)
+                    if moved:
+                        return True
+        except:
+            pass
+        time.sleep(0.3)
+    return False
+
+NAV_KEYWORDS = [
+    "next", "continue", "skip", "back", "weiter", "zurГјck", "next step", "proceed", 
+    "got it", "ok", "РїСЂРёРЅСЏС‚СЊ", "РѕРє", "start", "get started", "take the quiz", 
+    "accept", "allow", "agree", "alle akzeptieren", "alle ablehnen"
+]
+
+def is_nav_button(text: str) -> bool:
+    if not text: return False
+    t = text.lower().strip()
+    return any(w == t or t.startswith(w + " ") for w in NAV_KEYWORDS)
+
+def perform_action(page: Page, screen_type: str, log_func, results_dir: str, start_hash: str, start_url: str, fill_values: dict, repeat_attempt: int = 0):
+    try:
+        if "madmuscles.com/final/" in page.url.lower():
+            return "stopped at paywall"
+        if screen_type == 'paywall': return "stopped at paywall"
+        if screen_type == 'checkout': return "checkout reached"
+
+        # Проверяем наличие file upload/input[type="file"]
+        file_input = page.locator('input[type="file"]').first
+        if file_input.count() > 0:
+            log_func("Обнаружен file upload - создаем пустой файл и загружаем")
+            try:
+                # Создаем временный файл с тестовым изображением
+                import base64
+                # Минимальное PNG изображение (1x1 прозрачный пиксель)
+                png_data = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==')
+                temp_file = os.path.join(results_dir, 'temp_upload.png')
+                with open(temp_file, 'wb') as f:
+                    f.write(png_data)
+                file_input.set_input_files(temp_file)
+                time.sleep(1)
+                log_func("Файл загружен, ожидаем перехода...")
+                wait_for_transition(page, start_url, start_hash, timeout=5.0)
+                return "file_uploaded"
+            except Exception as e:
+                log_func(f"Ошибка загрузки файла: {str(e)[:80]}")
+                # Пробуем просто кликнуть если загрузка не сработала
+                pass
+
+        if screen_type in ['email', 'input']:
+            checked = ensure_privacy_checkbox_checked(page, log_func)
+            if checked: log_func("Чекбокс политики конфиденциальности отмечен")
+            
+            # Wait for inputs to be visible
+            try: page.wait_for_selector(FILLABLE_INPUT_SELECTOR, timeout=3000)
+            except: pass
+            
+            inputs = page.locator(FILLABLE_INPUT_SELECTOR)
+            inputs_count = inputs.count()
+            if inputs_count == 0:
+                log_func("Заполняемых полей не найдено, пропуск ветки input/email")
+                return "no_fillable_inputs"
+            for i in range(inputs_count):
+                inp = inputs.nth(i)
+                itype = (inp.get_attribute("type") or "text").lower()
+                placeholder = (inp.get_attribute("placeholder") or "").lower()
+                
+                val = fill_values.get("name", "John")
+                context_text = (page.evaluate("() => document.body.innerText") or "").lower()
+                context_url = page.url.lower()
+                input_hints = " ".join([
+                    placeholder,
+                    (inp.get_attribute("name") or "").lower(),
+                    (inp.get_attribute("id") or "").lower(),
+                    (inp.get_attribute("autocomplete") or "").lower(),
+                    (inp.get_attribute("aria-label") or "").lower(),
+                ])
+                is_name_field = any(k in input_hints for k in ["name", "full-name", "fullname", "first-name", "firstname"]) or any(
+                    k in page.evaluate("() => document.body.innerText.toLowerCase()") for k in ["what's your name", "what is your name", "your name", "full name", "first name"]
+                )
+                is_email_field = (
+                    screen_type == 'email'
+                    or itype == "email"
+                    or any(k in input_hints for k in ["email", "e-mail", "mail"])
+                    or (("/email" in page.url.lower() or "step=email" in page.url.lower()) and inputs_count == 1)
+                )
+                if is_name_field:
+                    is_email_field = False
+                if is_email_field:
+                    email_tpl = fill_values.get("email", "alexey.quiz@gmail.com")
+                    if "{ts}" in email_tpl:
+                        val = email_tpl.replace("{ts}", datetime.now().strftime('%m%d'))
+                    else:
+                        val = email_tpl
+                
+                is_dob_step = DATE_OF_BIRTH_STEP_KEY in context_url
+                is_date_field = (
+                    is_dob_step
+                    or "date of birth" in context_text
+                    or "birthday" in context_text
+                    or "dd / mm / yyyy" in context_text
+                    or "dd/mm/yyyy" in placeholder
+                    or "birth" in placeholder
+                    or "dob" in placeholder
+                )
+                
+                # Use word boundaries for numeric keywords to avoid false positives like 'age' in 'magic-page'
+                num_pattern = r'\b(age|height|weight|РІРѕР·СЂР°СЃС‚|СЂРѕСЃС‚|РІРµСЃ|bmi|goal|С†РµР»СЊ)\b'
+                is_numeric = itype == "number" or re.search(num_pattern, placeholder) or re.search(num_pattern, context_url)
+                
+                if is_date_field:
+                    val = fill_values.get("date_of_birth", "01/01/1990")
+                elif is_numeric and not is_email_field:
+                    if any(k in placeholder or k in context_url or k in context_text for k in ["height", "СЂРѕСЃС‚"]):
+                        val = fill_values.get("height", "170")
+                    elif any(k in placeholder or k in context_url or k in context_text for k in ["goal", "С†РµР»СЊ"]):
+                        val = fill_values.get("goal_weight", "60")
+                    elif any(k in placeholder or k in context_url or k in context_text for k in ["weight", "РІРµСЃ"]):
+                        val = fill_values.get("weight", "70")
+                    elif any(k in placeholder or k in context_url or k in context_text for k in ["age", "РІРѕР·СЂР°СЃС‚"]):
+                        val = fill_values.get("age", "30")
+                    else:
+                        val = fill_values.get("default_number", "25")
+                
+                try:
+                    log_func(f"Заполнение поля: тип={itype}, значение={val}")
+                    if is_date_field:
+                        # Masked DOB inputs often require sequential typing instead of fill().
+                        inp.click(timeout=500)
+                        inp.press("Control+A")
+                        inp.type(str(val), delay=45)
+                    else:
+                        inp.fill(str(val))
+                    time.sleep(0.3)
+                except Exception as e:
+                    if is_date_field:
+                        fallback_val = re.sub(r"[^\d]", "", str(val))
+                    else:
+                        fallback_val = re.sub(r"[^\d]", "", str(val)) if is_numeric else str(val)
+                    try:
+                        inp.click(timeout=500)
+                        inp.press("Control+A")
+                        inp.type(fallback_val, delay=35 if is_date_field else 20)
+                        time.sleep(0.2)
+                        log_func(f"Заполнение fallback: значение={fallback_val}")
+                    except Exception:
+                        log_func(f"Ошибка заполнения: {str(e)[:80]}")
+
+            time.sleep(0.4)
+            btn = find_continue_button(page, log_func)
+            if btn:
+                btn_txt = " ".join(safe_inner_text(btn, "").split())
+                log_func(f"Нажатие Continue: {btn_txt}")
+                close_popups(page, log_func)
+                try:
+                    btn.click(force=True, timeout=2000)
+                except:
+                    page.keyboard.press("Enter")
+            else: page.keyboard.press("Enter")
+            time.sleep(0.6)
+            if screen_type == 'email' and page.url == start_url and get_screen_hash(page) == start_hash:
+                btn_retry = find_continue_button(page, log_func)
+                if btn_retry:
+                    retry_txt = " ".join(safe_inner_text(btn_retry, "").split())
+                    log_func(f"Повторный submit email после рендера CTA: {retry_txt}")
+                    try:
+                        btn_retry.click(force=True, timeout=2000)
+                    except:
+                        pass
+                else:
+                    try:
+                        page.keyboard.press("Tab")
+                        page.keyboard.press("Enter")
+                    except:
+                        pass
+            log_func("Форма отправлена. Ожидание перехода...")
+            wait_for_transition(page, start_url, start_hash, timeout=12.0)
+            return "input_submitted"
+
+        if screen_type in ['question', 'info', 'other']:
+            is_workout_issues = "madmuscles.com" in page.url.lower() and WORKOUT_ISSUES_STEP_KEY in page.url.lower()
+            is_workout_frequency = "madmuscles.com" in page.url.lower() and WORKOUT_FREQUENCY_STEP_KEY in page.url.lower()
+            cont_btn = find_continue_button(page, log_func)
+
+            if is_workout_frequency and repeat_attempt > 0:
+                log_func("Повтор step-workout-frequency: пробую Continue -> Got it без нового выбора")
+                if cont_btn and cont_btn.is_enabled():
+                    try:
+                        pre_cont_hash = get_screen_hash(page)
+                        cont_btn.click(force=True, timeout=1500)
+                        moved = wait_for_transition(page, page.url, pre_cont_hash, timeout=4.0)
+                        if moved:
+                            return "continue_clicked"
+                    except:
+                        pass
+                if try_click_got_it(page, log_func, timeout=8.0):
+                    return "continue_clicked"
+            # Priority to "Start" buttons only on info-like screens.
+            # For question screens this often causes loops when real action is selecting an option first.
+            if screen_type == 'info' and cont_btn and any(k in (cont_btn.inner_text() or "").lower() for k in ["start", "get my", "get started", "take the", "offer", "claim", "discount", "spin"]):
+                c_txt = " ".join((cont_btn.inner_text() or "").split())
+                log_func(f"Найдена кнопка старта: {c_txt}. Нажимаю...")
+                
+                # Проверяем и обрабатываем блокираторы формы перед кликом
+                check_and_handle_form_blockers(page, log_func)
+
+                close_popups(page, log_func)
+                pre_start_hash = get_screen_hash(page)
+                cont_btn.click(force=True, timeout=1000)
+                moved = wait_for_transition(page, start_url, start_hash)
+                if not moved:
+                    is_paywall, paywall_reason = detect_paywall_signals(page)
+                else:
+                    is_paywall, paywall_reason = False, ""
+                if not moved and is_paywall:
+                    log_func(f"Страница похожа на paywall после клика старта: {paywall_reason}")
+                    return "stopped at paywall"
+                if not moved and get_screen_hash(page) == pre_start_hash:
+                    log_func("Клик по старту не изменил экран")
+                    # Повторная проверка блокираторов если клик не сработал
+                    if check_and_handle_form_blockers(page, log_func):
+                        log_func("Повторный клик после обработки блокираторов")
+                        pre_start_hash2 = get_screen_hash(page)
+                        cont_btn.click(force=True, timeout=1000)
+                        moved = wait_for_transition(page, start_url, pre_start_hash2, timeout=5.0)
+                        if moved:
+                            return "start_button_pressed_retry"
+                return "start_button_pressed"
+
+            choice_sel = [
+                "[data-testid*='answer' i]:visible", 
+                "button:visible", 
+                "[class*='Item' i]:visible", 
+                "[class*='Card' i]:visible", 
+                "[class*='option' i]:visible",
+                "[class*='answer' i]:visible",
+                "[class*='choice' i]:visible",
+                "label:visible"
+            ]
+            text_targets = []
+            # Pass 1: Try all selectors to find a choice WITH text (excluding Nav)
+            for s in choice_sel:
+                els = page.locator(s)
+                els_count = els.count()
+                for i in range(els_count):
+                    curr = els.nth(i)
+                    if is_forbidden_button(curr, log_func): continue
+                    try:
+                        is_int = curr.evaluate("""el => {
+                            const t = (el.tagName || '').toLowerCase();
+                            if (t === 'button' || t === 'a' || t === 'label' || t === 'input') return true;
+                            if ((el.getAttribute('role') || '').toLowerCase() === 'button') return true;
+                            if (typeof el.onclick === 'function') return true;
+                            const st = window.getComputedStyle(el);
+                            return st.cursor === 'pointer';
+                        }""")
+                        if not is_int:
+                            continue
+                    except:
+                        pass
+                    if is_workout_issues:
+                        try:
+                            cb = curr.locator("input[type='checkbox']").first
+                            if cb.count() > 0 and cb.is_checked():
+                                continue
+                        except:
+                            pass
+                    txt = safe_inner_text(curr, "")
+                    if txt and not re.search(r'^\d+\s*/\s*\d+$', txt) and len(txt) < 100 and not is_nav_button(txt):
+                        txt_l = txt.lower()
+                        if any(term in txt_l for term in QUESTION_NEGATIVE_TERMS):
+                            continue
+                        text_targets.append(curr)
+
+            if screen_type == 'question' and is_calendar_question(page) and has_skip_question_control(page):
+                # Для календарных шагов не пытаемся бесконечно перебирать даты через обычный text target.
+                # Если после выбора дата не продвигает экран, ниже сработает fallback через Skip this question.
+                target_pool = []
+            else:
+                target_pool = text_targets
+            target = None
+            if target_pool:
+                # Улучшенный выбор: используем JS для получения уникальных идентификаторов элементов
+                # Это помогает отличать элементы с одинаковым текстом но разными данными
+                element_hashes = []
+                for el in target_pool:
+                    try:
+                        el_hash = el.evaluate("""el => {
+                            // Генерируем уникальный хеш для элемента на основе:
+                            // - Позиции в DOM
+                            // - Атрибутов (id, class, data-*)
+                            // - Соседних элементов
+                            const attrs = {
+                                id: el.id,
+                                class: el.className,
+                                role: el.getAttribute('role'),
+                                'data-testid': el.getAttribute('data-testid'),
+                                'data-index': el.getAttribute('data-index'),
+                                type: el.getAttribute('type'),
+                                name: el.getAttribute('name')
+                            };
+                            
+                            // Позиция родителя
+                            const parent = el.parentElement;
+                            const parentClass = parent?.className || '';
+                            const siblingIndex = Array.from(parent?.children || []).indexOf(el);
+                            
+                            return JSON.stringify({
+                                attrs,
+                                parentClass,
+                                siblingIndex,
+                                tagName: el.tagName
+                            });
+                        }""")
+                        element_hashes.append(el_hash)
+                    except:
+                        element_hashes.append(None)
+                
+                # Если есть повторная попытка, выбираем элемент с уникальным хешем
+                if repeat_attempt > 0 and len(target_pool) > 1:
+                    if any("get started" in safe_inner_text(el, "").lower() for el in target_pool):
+                        for idx, el in enumerate(target_pool):
+                            txt = safe_inner_text(el, "").lower()
+                            if any(term in txt for term in ["male", "female", "man", "woman"]):
+                                chosen_idx = idx
+                                target = target_pool[chosen_idx]
+                                log_func(f"Повтор стартового экрана: вместо Get Started выбираю вариант #{chosen_idx + 1}")
+                                break
+                    if target is not None:
+                        pass
+                    else:
+                    # Получаем хеши уже кликнутого элемента
+                        clicked_hash = element_hashes[0] if element_hashes else None
+                    
+                    # Ищем элемент с отличающимся хешем
+                        found_different = False
+                        for idx, el_hash in enumerate(element_hashes):
+                            if el_hash and el_hash != clicked_hash:
+                                chosen_idx = idx
+                                target = target_pool[chosen_idx]
+                                found_different = True
+                                log_func(f"Повтор шага: выбран альтернативный элемент #{chosen_idx + 1} (уникальный хеш)")
+                                break
+                    
+                    # Если все элементы одинаковые, пробуем кликнуть по следующему
+                        if not found_different:
+                            chosen_idx = repeat_attempt % len(target_pool)
+                            target = target_pool[chosen_idx]
+                            log_func(f"Повтор шага: все элементы одинаковые, пробую #{chosen_idx + 1}")
+                else:
+                    chosen_idx = 0
+                    for idx, candidate_el in enumerate(target_pool):
+                        candidate_text = safe_inner_text(candidate_el, "").lower()
+                        if any(term in candidate_text for term in SELECT_ALL_KEYWORDS):
+                            chosen_idx = idx
+                            break
+                    target = target_pool[chosen_idx]
+
+            if not target:
+                if screen_type == 'question':
+                    if cont_btn and any(k in (safe_inner_text(cont_btn, "").lower()) for k in ["start", "get started", "start the test", "take the test", "begin"]):
+                        log_func(f"Для question-экрана без валидных опций нажимаю стартовый CTA: {' '.join(safe_inner_text(cont_btn, '').split())}")
+                        close_popups(page, log_func)
+                        pre_start_hash = get_screen_hash(page)
+                        try:
+                            cont_btn.click(force=True, timeout=1500)
+                        except:
+                            pass
+                        moved = wait_for_transition(page, start_url, pre_start_hash, timeout=8.0)
+                        if moved:
+                            return "question_start_cta_clicked"
+                    pre_option_hash = get_screen_hash(page)
+                    clicked_option = try_click_question_option_js(
+                        page,
+                        log_func,
+                        repeat_attempt=repeat_attempt,
+                        prefer_skip=is_calendar_question(page) and has_skip_question_control(page)
+                    )
+                    if clicked_option:
+                        moved = wait_for_transition(page, start_url, pre_option_hash, timeout=3.5)
+                        if moved:
+                            return "question_choice_clicked_js"
+
+                        curr_cont = find_continue_button(page, log_func)
+                        if curr_cont and curr_cont.is_enabled():
+                            c_txt = " ".join((curr_cont.inner_text() or "").split())
+                            log_func(f"После JS выбора нажимаю Continue: {c_txt}")
+                            close_popups(page, log_func)
+                            pre_cont_hash = get_screen_hash(page)
+                            try:
+                                curr_cont.click(force=True, timeout=1500)
+                            except:
+                                pass
+                            moved = wait_for_transition(page, page.url, pre_cont_hash, timeout=8.0)
+                            if moved:
+                                return "question_choice_clicked_js_continue"
+                            log_func("После JS выбора Continue не привел к переходу")
+
+                        if is_calendar_question(page):
+                            log_func("Обнаружен календарный шаг без доступного Continue. Пробую Skip")
+                            pre_skip_hash = get_screen_hash(page)
+                            if try_click_skip_question_js(page, log_func):
+                                moved = wait_for_transition(page, page.url, pre_skip_hash, timeout=8.0)
+                                if moved:
+                                    return "question_skipped_js"
+
+                    if is_calendar_question(page):
+                        log_func("Для календарного шага не найден валидный выбор. Пробую Skip")
+                        pre_skip_hash = get_screen_hash(page)
+                        if try_click_skip_question_js(page, log_func):
+                            moved = wait_for_transition(page, page.url, pre_skip_hash, timeout=8.0)
+                            if moved:
+                                return "question_skipped_js"
+
+                    return "no_choices_found"
+
+                if cont_btn:
+                    c_txt = " ".join(safe_inner_text(cont_btn, "").split())
+                    log_func(f"Нет вариантов, нажимаю Continue: {c_txt}")
+                    close_popups(page, log_func)
+                    cont_btn.click(force=True, timeout=1000)
+                    moved = wait_for_transition(page, start_url, start_hash)
+                    if moved:
+                        return "info_continue_pressed"
+                    log_func("Continue не изменил экран")
+                else:
+                    pre_js_hash = get_screen_hash(page)
+                    if try_click_continue_js(page, log_func):
+                        moved = wait_for_transition(page, start_url, pre_js_hash, timeout=8.0)
+                        if moved:
+                            return "info_continue_pressed_js"
+                return "no_choices_found"
+            start_ui = get_ui_step(page)
+            # 1. Click choice
+            clean_target_text = " ".join(safe_inner_text(target, "").split())
+            target_is_select_all = any(term in clean_target_text.lower() for term in SELECT_ALL_KEYWORDS)
+            display_text = clean_target_text[:50] if clean_target_text else "<No text>"
+            log_func(f"Нажатие выбора: {display_text}")
+            try:
+                target.scroll_into_view_if_needed(timeout=2000)
+            except: pass
+            close_popups(page, log_func)
+            try:
+                target.click(force=True, timeout=2000)
+            except Exception as e:
+                log_func(f"Ошибка клика: {str(e)[:50]}")
+            
+            # Short wait for auto-advance or progress change
+            log_func("Ожидание авто-перехода...")
+            start_wait = time.time()
+            transitioned_auto = False
+            while time.time() - start_wait < 2.0:
+                curr_ui = get_ui_step(page)
+                if page.url != start_url:
+                    log_func(f"Обнаружен авто-переход по URL: {start_url} -> {page.url}")
+                    transitioned_auto = True
+                    break
+                if curr_ui != start_ui and curr_ui != "unknown":
+                    log_func(f"Обнаружен авто-переход (ui_step: {start_ui} -> {curr_ui})")
+                    transitioned_auto = True
+                    break
+                time.sleep(0.3)
+            
+            if transitioned_auto:
+                return "auto_advanced"
+
+            # MadMuscles frequently shows a post-answer hint card with mandatory "Got it".
+            if "madmuscles.com" in page.url.lower():
+                if try_click_got_it(page, log_func, timeout=4.0):
+                    return "continue_clicked"
+
+            # This step often renders Continue -> info card -> Got it with slight delay.
+            if is_workout_frequency:
+                if try_click_got_it(page, log_func, timeout=5.0):
+                    return "continue_clicked"
+
+            if is_workout_issues:
+                for label in ["Got it", "Continue"]:
+                    btns = page.locator("button:visible, [role='button']:visible, a:visible").get_by_text(label, exact=False)
+                    if btns.count() > 0:
+                        try:
+                            btn = btns.first
+                            if btn.is_enabled():
+                                log_func(f"Спец-шаг workout-issues: нажимаю {label}")
+                                pre_hash = get_screen_hash(page)
+                                btn.click(force=True, timeout=1500)
+                                moved = wait_for_transition(page, page.url, pre_hash, timeout=8.0)
+                                if moved:
+                                    return "continue_clicked"
+                        except:
+                            pass
+
+            # 2. Wait for Next button if no auto-advance
+            start_time = time.time()
+            clicked_continue = False
+            wait_budget = 4.5 if target_is_select_all else 3.0
+            while time.time() - start_time < wait_budget:
+                curr_ui = get_ui_step(page)
+                if curr_ui != start_ui and curr_ui != "unknown":
+                    break
+
+                # Safe URL check: only break if the PATH changes
+                if urlparse(page.url).path != urlparse(start_url).path:
+                    break 
+
+                curr_cont = find_continue_button(page, log_func)
+                if curr_cont and curr_cont.is_enabled():
+                    c_txt = " ".join(safe_inner_text(curr_cont, "").split())
+                    log_func(f"Найдена кнопка Continue: {c_txt}. Нажимаю...")
+                    close_popups(page, log_func)
+                    pre_cont_hash = get_screen_hash(page)
+                    try:
+                        curr_cont.click(force=True, timeout=2000)
+                    except: pass
+                    clicked_continue = True
+                    moved = wait_for_transition(page, page.url, pre_cont_hash, timeout=10.0)
+                    if moved:
+                        return "continue_clicked"
+                    if "madmuscles.com" in page.url.lower():
+                        got_it_timeout = 8.0 if is_workout_frequency else 3.0
+                        if try_click_got_it(page, log_func, timeout=got_it_timeout):
+                            return "continue_clicked"
+                    log_func("Continue нажат, но переход не произошел")
+                    pre_js_hash = get_screen_hash(page)
+                    if try_click_continue_js(page, log_func):
+                        moved_js = wait_for_transition(page, page.url, pre_js_hash, timeout=8.0)
+                        if moved_js:
+                            return "continue_clicked_js"
+                time.sleep(0.5)
+
+            if screen_type == 'question' and is_calendar_question(page):
+                log_func("Календарный шаг не продвинулся после выбора. Пробую Skip")
+                pre_skip_hash = get_screen_hash(page)
+                if try_click_skip_question_js(page, log_func):
+                    moved = wait_for_transition(page, page.url, pre_skip_hash, timeout=8.0)
+                    if moved:
+                        return "question_skipped_js"
+
+            # 3. Multiselect
+            if not clicked_continue:
+                curr_cont = find_continue_button(page, log_func)
+                if curr_cont and not curr_cont.is_enabled():
+                    log_func("Обнаружен мультивыбор. Выбираю дополнительные варианты...")
+                    for s in choice_sel:
+                        els = page.locator(s)
+                        els_count = els.count()
+                        for i in range(1, min(els_count, 5)):
+                            curr = els.nth(i)
+                            txt = safe_inner_text(curr, "")
+                            if txt and not re.search(r'^\d+\s*/\s*\d+$', txt) and not is_forbidden_button(curr, log_func):
+                                close_popups(page, log_func)
+                                curr.click(force=True, timeout=500)
+                                if curr_cont.is_enabled():
+                                    close_popups(page, log_func)
+                                    pre_multi_hash = get_screen_hash(page)
+                                    curr_cont.click(force=True, timeout=1000)
+                                    moved = wait_for_transition(page, page.url, pre_multi_hash, timeout=10.0)
+                                    if moved:
+                                        return "multiselect_completed"
+                                    log_func("После мультивыбора переход не произошел")
+
+            # 4. Consent checkbox fallback for pages that block progress until terms are accepted.
+            consent_checked = ensure_consent_checkbox_checked(page, log_func)
+            if consent_checked:
+                curr_cont = find_continue_button(page, log_func)
+                if curr_cont and curr_cont.is_enabled():
+                    c_txt = " ".join(safe_inner_text(curr_cont, "").split())
+                    log_func(f"После согласия нажимаю Continue: {c_txt}")
+                    close_popups(page, log_func)
+                    pre_consent_hash = get_screen_hash(page)
+                    try:
+                        curr_cont.click(force=True, timeout=1500)
+                    except:
+                        pass
+                    moved = wait_for_transition(page, page.url, pre_consent_hash, timeout=8.0)
+                    if moved:
+                        return "consent_continue_clicked"
+                    log_func("После согласия Continue не привел к переходу")
+                try:
+                    log_func("После согласия повторяю клик по варианту ответа")
+                    pre_retry_hash = get_screen_hash(page)
+                    target.click(force=True, timeout=1000)
+                    wait_for_transition(page, page.url, pre_retry_hash, timeout=8.0)
+                    return "consent_choice_reclicked"
+                except Exception as e:
+                    log_func(f"Не удалось повторно кликнуть вариант после согласия: {str(e)[:80]}")
+
+            wait_for_transition(page, start_url, start_hash, timeout=5.0)
+            return "screen_interaction_completed"                
+    except Exception as e: return f"err:{str(e)}"
+    return "none"
+
+def load_runner_config(config_path: str = 'config.json') -> dict:
+    with open(config_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def run_funnel(
+    url: str,
+    config: dict,
+    is_headless: bool,
+    progress_callback=None,
+    stop_event=None,
+    artifact_callback=None,
+    write_manifest: bool = False,
+):
+    slug = get_slug(url); res_dir = os.path.join('results', slug); os.makedirs(res_dir, exist_ok=True)
+    classified_dir = os.path.join('results', '_classified')
+    for cat in ['question', 'info', 'input', 'email', 'paywall', 'other', 'checkout']:
+        os.makedirs(os.path.join(classified_dir, cat), exist_ok=True)
+
+    runner_cfg = config.get("runner", {}) if isinstance(config.get("runner"), dict) else {}
+    result = {
+        "url": url,
+        "slug": slug,
+        "steps_total": 0,
+        "paywall_reached": False,
+        "start_url": url,
+        "last_url": "",
+        "path": res_dir,
+        "error": None,
+        "last_screenshot": None,
+        "log_path": os.path.join(res_dir, 'log.txt'),
+        "manifest_path": None,
+        "stopped": False,
+        "progress_message": "",
+    }
+    max_steps = int(runner_cfg.get("max_steps", config.get("max_steps", 80)))
+    slow_mo = int(runner_cfg.get("slow_mo_ms", config.get("slow_mo_ms", 100)))
+    fill_values = resolve_fill_values(config)
+    ai_settings = resolve_ai_fallback_settings(config)
+    log_lines = []
+    page = None
+
+    def emit_artifact(file_path, drive_subdir: str = ""):
+        if not file_path or not artifact_callback:
+            return
+        try:
+            artifact_callback(file_path, drive_subdir)
+        except Exception:
+            pass
+
+    with open(result["log_path"], 'w', encoding='utf-8') as f:
+        def log(m):
+            l = f"[{time.strftime('%H:%M:%S')}] {m}\n"
+            f.write(l)
+            f.flush()
+            print(l.strip())
+            log_lines.append(l.strip())
+
+        def request_progress(current_step: int, total_steps: int, message: str = "", last_url: str = None):
+            result["progress_message"] = message
+            if progress_callback:
+                try:
+                    progress_callback(current_step, total_steps, message, last_url)
+                except Exception:
+                    pass
+
+        def stop_requested() -> bool:
+            return bool(stop_event and stop_event.is_set())
+
+        def save_last_state(current_page=None) -> None:
+            try:
+                if current_page:
+                    result["last_url"] = current_page.url or result.get("last_url") or url
+                    screen_name = f"{max(int(result.get('steps_total', 0)), 0):02d}_stopped.png"
+                    local_path = os.path.join(res_dir, screen_name)
+                    current_page.screenshot(path=local_path, full_page=True)
+                    result["last_screenshot"] = local_path
+                    emit_artifact(local_path)
+            except Exception as screenshot_error:
+                log(f"Ошибка сохранения финального состояния при остановке: {str(screenshot_error)[:120]}")
+
+        def apply_stop(current_page=None, message: str = "Остановлено пользователем") -> bool:
+            if not stop_requested():
+                return False
+            result["stopped"] = True
+            result["error"] = None
+            result["paywall_reached"] = False
+            result["progress_message"] = message
+            log(message)
+            save_last_state(current_page)
+            request_progress(result.get("steps_total", 0), max_steps, message, result.get("last_url"))
+            return True
+
+        def interruptible_sleep(seconds: float, current_page=None) -> bool:
+            if not stop_event:
+                time.sleep(seconds)
+                return False
+            remaining = float(seconds)
+            while remaining > 0:
+                if apply_stop(current_page, "Остановка запрошена во время ожидания"):
+                    return True
+                chunk = min(0.25, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
+            return False
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=is_headless, slow_mo=slow_mo)
+                page = browser.new_context(**p.devices['iPhone 13']).new_page()
+
+                def handle_console(msg):
+                    if msg.type == "error":
+                        try:
+                            page.evaluate("""(text) => {
+                                if (!window.__qwen_console_errors) {
+                                    window.__qwen_console_errors = [];
+                                }
+                                window.__qwen_console_errors.push(text);
+                                if (window.__qwen_console_errors.length > 100) {
+                                    window.__qwen_console_errors.shift();
+                                }
+                            }""", msg.text)
+                        except:
+                            pass
+                page.on("console", handle_console)
+
+                if apply_stop(page, "Остановлено пользователем до открытия страницы"):
+                    browser.close()
+                    return result
+
+                log(f"Переход на {url} (slug: {slug})")
+                try:
+                    page.goto(url, wait_until='load', timeout=60000)
+                    result["last_url"] = page.url or url
+                except TimeoutError:
+                    result["error"] = "navigation_timeout"
+                    result["last_url"] = page.url or url
+                    log("Ошибка: таймаут открытия страницы")
+                    try:
+                        save_error_artifacts(page, url, result["error"], log_lines, log)
+                    except:
+                        pass
+                    browser.close()
+                    return result
+
+                step = 1
+                history_counts = defaultdict(int)
+                step_attempts = defaultdict(int)
+                ai_attempts = defaultdict(int)
+                last_error_artifacts_saved = False
+                url_history = [page.url]
+
+                while step <= max_steps:
+                    if apply_stop(page, f"Остановлено пользователем на шаге {step}"):
+                        break
+
+                    request_progress(step, max_steps, f"Обработка шага {step}...", page.url)
+
+                    curr_u = page.url
+                    if any(k in curr_u for k in ["magic", "analyzing", "loading", "preparePlan"]):
+                        if interruptible_sleep(10, page):
+                            break
+                        curr_u = page.url
+
+                    close_popups(page, log)
+                    if interruptible_sleep(1, page):
+                        break
+                    curr_h = get_screen_hash(page)
+                    st = classify_screen(page, log)
+                    ui_before = get_ui_step(page)
+                    if st in ['paywall', 'checkout']:
+                        warmup_page_for_full_screenshot(page, log)
+                        curr_h = get_screen_hash(page)
+                    step_key = f"{urlparse(curr_u).path}|{ui_before}|{st}"
+                    repeat_attempt = step_attempts[step_key]
+                    step_attempts[step_key] += 1
+
+                    curr_id = f"{curr_u}|{curr_h}"
+                    history_counts[curr_id] += 1
+                    loop_limit = 8 if WORKOUT_ISSUES_STEP_KEY in curr_u.lower() else 3
+                    if history_counts[curr_id] >= loop_limit:
+                        ai_budget = int(ai_settings.get("max_attempts_per_screen", 2))
+                        if ai_settings.get("enabled") and ai_attempts[curr_id] < ai_budget:
+                            ai_attempts[curr_id] += 1
+                            log(f"Обнаружено зацикливание на {curr_u}. Пробую AI fallback (attempt {ai_attempts[curr_id]}/{ai_budget})")
+                            fallback_result = run_ai_fallback(
+                                page=page,
+                                config=config,
+                                results_dir=res_dir,
+                                fill_values=fill_values,
+                                screen_type=st,
+                                stuck_reason="stuck_loop",
+                                repeat_attempt=repeat_attempt,
+                                ui_step=ui_before,
+                                screen_hash=curr_h,
+                                log_lines=log_lines,
+                                log_func=log,
+                            )
+                            log(f"AI fallback result: {fallback_result.get('status')} | reason={fallback_result.get('reason')}")
+                            if interruptible_sleep(1.5, page):
+                                break
+                            after_ai_hash = get_screen_hash(page)
+                            after_ai_ui = get_ui_step(page)
+                            if has_meaningful_progress(curr_u, page.url, curr_h, after_ai_hash, ui_before, after_ai_ui):
+                                history_counts[curr_id] = 0
+                                continue
+                        log(f"Обнаружено зацикливание на {curr_u}. Остановка.")
+                        result["error"] = "stuck_loop"
+                        result["last_url"] = page.url or curr_u or url
+                        try:
+                            save_error_artifacts(page, url, result["error"], log_lines, log)
+                            last_error_artifacts_saved = True
+                        except:
+                            pass
+                        break
+
+                    screen_name = f"{step:02d}_{st}.png"
+                    local_path = os.path.join(res_dir, screen_name)
+                    result["last_screenshot"] = local_path
+                    try:
+                        page.screenshot(path=local_path, full_page=True)
+                        classified_path = os.path.join(classified_dir, st, f"{slug}__{screen_name}")
+                        shutil.copy2(local_path, classified_path)
+                        emit_artifact(local_path)
+                        emit_artifact(classified_path, drive_subdir=f"_classified/{st}")
+                        if st in ['paywall', 'checkout']:
+                            plans_name = f"{step:02d}_{st}_plans.png"
+                            plans_path = os.path.join(res_dir, plans_name)
+                            classified_plans_path = os.path.join(classified_dir, st, f"{slug}__{plans_name}")
+                            if save_paywall_plans_screenshot(page, local_path, plans_path, log):
+                                try:
+                                    shutil.copy2(plans_path, classified_plans_path)
+                                    emit_artifact(plans_path)
+                                    emit_artifact(classified_plans_path, drive_subdir=f"_classified/{st}")
+                                except Exception as plans_copy_error:
+                                    log(f"Paywall plans: ошибка сохранения classified screenshot: {str(plans_copy_error)[:120]}")
+                    except Exception as e:
+                        log(f"Ошибка сохранения скриншота: {str(e)[:120]}")
+
+                    log(f"Шаг:{step} | тип:{st} | ui_step:{ui_before} | url:{page.url[:60]}")
+                    act = perform_action(page, st, log, res_dir, curr_h, curr_u, fill_values, repeat_attempt=repeat_attempt)
+
+                    if apply_stop(page, f"Остановлено пользователем после действия на шаге {step}"):
+                        break
+
+                    if interruptible_sleep(1, page):
+                        break
+                    ui_after = get_ui_step(page)
+
+                    def parse_ui(s):
+                        if not s or s == "unknown": return -1
+                        m = re.match(r'(\d+)', s)
+                        return int(m.group(1)) if m else -1
+
+                    ui_b_num = parse_ui(ui_before)
+                    ui_a_num = parse_ui(ui_after)
+                    if ui_a_num > ui_b_num + 1 and ui_b_num > 0:
+                        log(f"Обнаружен пропуск шага UI: {ui_before} -> {ui_after}")
+
+                    log(f"Результат действия:{act}")
+
+                    curr_hash_after_action = get_screen_hash(page)
+                    if ai_settings.get("enabled"):
+                        stuck_state = detect_page_stuck_state(page, log)
+                        no_progress = not has_meaningful_progress(curr_u, page.url, curr_h, curr_hash_after_action, ui_before, ui_after)
+                        ai_reason = None
+                        if stuck_state.get("is_stuck"):
+                            ai_reason = str(stuck_state.get("reason") or "stuck_state")
+                        elif no_progress and not any(k in act for k in ["paywall", "checkout", "reached", "stopped"]):
+                            ai_reason = "no_progress_after_action"
+
+                        ai_curr_id = f"{curr_u}|{curr_h}|{ui_before}|{st}"
+                        ai_budget = int(ai_settings.get("max_attempts_per_screen", 2))
+                        if ai_reason and ai_attempts[ai_curr_id] < ai_budget:
+                            ai_attempts[ai_curr_id] += 1
+                            log(f"AI fallback trigger: reason={ai_reason} | attempt {ai_attempts[ai_curr_id]}/{ai_budget}")
+                            fallback_result = run_ai_fallback(
+                                page=page,
+                                config=config,
+                                results_dir=res_dir,
+                                fill_values=fill_values,
+                                screen_type=st,
+                                stuck_reason=ai_reason,
+                                repeat_attempt=repeat_attempt,
+                                ui_step=ui_before,
+                                screen_hash=curr_h,
+                                log_lines=log_lines,
+                                log_func=log,
+                            )
+                            log(f"AI fallback result: {fallback_result.get('status')} | reason={fallback_result.get('reason')}")
+                            if interruptible_sleep(1.5, page):
+                                break
+
+                    url_history.append(page.url)
+                    if detect_url_loop(page, url_history, log):
+                        log(f"Обнаружен циклический переход. Пробуем альтернативное действие.")
+                        step_attempts[step_key] = min(step_attempts[step_key] + 2, 5)
+
+                    result["steps_total"] = step
+                    result["last_url"] = page.url
+                    if st in ['paywall', 'checkout'] or "stopped" in act or "reached" in act:
+                        if st in ['paywall', 'checkout'] or "paywall" in act:
+                            result["paywall_reached"] = True
+                        break
+
+                    step += 1
+
+                if result["error"] and not result["stopped"] and not last_error_artifacts_saved:
+                    try:
+                        result["last_url"] = page.url or result.get("last_url") or url
+                        save_error_artifacts(page, url, result["error"], log_lines, log)
+                    except:
+                        pass
+
+                result["last_url"] = page.url or result.get("last_url") or url
+                browser.close()
+        except Exception as e:
+            result["error"] = f"runner_exception:{str(e)[:180]}"
+            log(f"Критическая ошибка раннера: {str(e)[:180]}")
+            try:
+                result["last_url"] = page.url if page else result.get("last_url") or url
+                save_error_artifacts(page, url, result["error"], log_lines, log)
+            except:
+                pass
+        finally:
+            if write_manifest:
+                manifest = {
+                    "url": url,
+                    "started_at": datetime.now().isoformat(),
+                    "completed_at": datetime.now().isoformat(),
+                    "status": "cancelled" if result["stopped"] else ("success" if result["paywall_reached"] else "completed"),
+                    "steps_total": result["steps_total"],
+                    "paywall_reached": result["paywall_reached"],
+                    "error": result["error"],
+                    "last_url": result.get("last_url"),
+                    "progress_message": result.get("progress_message"),
+                }
+                manifest_path = os.path.join(res_dir, 'manifest.json')
+                with open(manifest_path, 'w', encoding='utf-8') as mf:
+                    json.dump(manifest, mf, indent=2, ensure_ascii=False)
+                result["manifest_path"] = manifest_path
+                emit_artifact(manifest_path)
+            emit_artifact(result.get("log_path"))
+    return result
+

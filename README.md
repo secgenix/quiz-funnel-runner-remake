@@ -80,7 +80,7 @@ cp .env.example .env
 
 ```ini
 TELEGRAM_BOT_TOKEN=1234567890:AABBccDDeeFFggHHiiJJkkLLmmNNooP
-TELEGRAM_ADMIN_ID=123456789
+ADMIN_IDS=123456789,987654321
 ```
 
 5. Запустите бота:
@@ -89,7 +89,7 @@ TELEGRAM_ADMIN_ID=123456789
 python bot.py
 ```
 
-**Примечание:** Токен и admin_id из `.env` имеют приоритет над значениями в `config.json`.
+**Примечание:** Токен и список администраторов из `.env` имеют приоритет над значениями в `config.json`. Для обратной совместимости старый `TELEGRAM_ADMIN_ID` тоже поддерживается, если `ADMIN_IDS` не задан.
 
 ## Конфигурация (`config.json`)
 
@@ -128,7 +128,7 @@ python bot.py
 
 ### Для Telegram-бота
 
-**Важно:** Токен и admin_id рекомендуется хранить в `.env` файле, а не в `config.json`.
+**Важно:** Токен и список администраторов рекомендуется хранить в `.env` файле, а не в `config.json`.
 
 ```json
 {
@@ -145,7 +145,9 @@ python bot.py
   "google_drive": {
     "enabled": false,
     "credentials_file": "credentials.json",
-    "folder_id": ""
+    "token_file": "token.json",
+    "folder_id": "",
+    "root_folder_name": "Quiz Funnel Runner Results"
   },
   "captcha": {
     "enabled": false,
@@ -160,13 +162,21 @@ python bot.py
 | Переменная | Описание |
 |------------|----------|
 | `TELEGRAM_BOT_TOKEN` | Токен бота от @BotFather |
-| `TELEGRAM_ADMIN_ID` | Ваш Telegram User ID |
+| `ADMIN_IDS` | Список Telegram User ID администраторов через запятую |
+| `TELEGRAM_ADMIN_ID` | Legacy-переменная для одного администратора, используется только для обратной совместимости |
+| `GOOGLE_DRIVE_ENABLED` | Включение Google Drive интеграции через `.env` |
+| `GOOGLE_DRIVE_CREDENTIALS_FILE` | Путь к OAuth client JSON или service account JSON |
+| `GOOGLE_DRIVE_TOKEN_FILE` | Файл для сохранения OAuth токена |
+| `GOOGLE_DRIVE_FOLDER_ID` | ID готовой корневой папки в Google Drive |
+| `GOOGLE_DRIVE_ROOT_FOLDER_NAME` | Имя корневой папки, которую нужно создать/переиспользовать, если `folder_id` пуст |
 
 #### Параметры бота (config.json)
 
 | Параметр | Описание |
 |----------|----------|
 | `use_only_admin` | Если `true`, только администраторы могут использовать бота |
+| `admin_ids` | Необязательный список Telegram User ID администраторов в `config.json`, если не используется `.env` |
+| `allowed_users` | Legacy-список разрешённых пользователей; больше не ограничивает доступ, если `use_only_admin=false` |
 
 ## Telegram-бот
 
@@ -202,25 +212,45 @@ python bot.py
 
 ## Google Drive интеграция
 
+Интеграция теперь рассчитана на реальное использование:
+- повторно использует клиент Google Drive API между загрузками;
+- автоматически создаёт или переиспользует нужные папки;
+- не перезаливает файл, если в целевой папке уже есть файл с тем же именем и размером;
+- использует retry/backoff для временных ошибок `403`, `429` и `5xx`;
+- пишет диагностические логи по авторизации, квотам и сетевым ошибкам;
+- поддерживает OAuth desktop client JSON и service account JSON.
+
 ### Быстрая настройка
 
 1. Следуйте инструкции в [`GOOGLE_DRIVE_SETUP.md`](GOOGLE_DRIVE_SETUP.md)
 2. Скопируйте `credentials.json` в директорию проекта
-3. Добавьте folder_id в `.env`:
+3. Заполните переменные Google Drive в `.env`:
 
 ```ini
+GOOGLE_DRIVE_ENABLED=true
+GOOGLE_DRIVE_CREDENTIALS_FILE=client_secret.json
+GOOGLE_DRIVE_TOKEN_FILE=token.json
 GOOGLE_DRIVE_FOLDER_ID=1ABC123xyz...
+GOOGLE_DRIVE_ROOT_FOLDER_NAME=Quiz Funnel Runner Results
 ```
 
-4. Включите интеграцию в `config.json`:
+4. Включите интеграцию в `config.json` или через `.env`:
 
 ```json
 {
   "google_drive": {
-    "enabled": true
+    "enabled": true,
+    "credentials_file": "client_secret.json",
+    "token_file": "token.json",
+    "folder_id": "",
+    "root_folder_name": "Quiz Funnel Runner Results"
   }
 }
 ```
+
+Рекомендуемая схема:
+- если у вас уже есть папка в Drive, задайте `GOOGLE_DRIVE_FOLDER_ID`;
+- если папки ещё нет, оставьте `GOOGLE_DRIVE_FOLDER_ID` пустым и задайте `GOOGLE_DRIVE_ROOT_FOLDER_NAME` — папка будет создана автоматически и затем переиспользоваться.
 
 ### Структура файлов в Google Drive
 

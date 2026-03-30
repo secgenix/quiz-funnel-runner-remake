@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Sequence
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -40,8 +40,11 @@ class FunnelTask:
     log_path: Optional[str] = None
     manifest_path: Optional[str] = None
     drive_folder_url: Optional[str] = None
+    last_url: Optional[str] = None
     progress_message: str = ""
     current_step: int = 0
+    stop_requested: bool = False
+    stop_requested_at: Optional[datetime] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Преобразование в словарь"""
@@ -60,8 +63,11 @@ class FunnelTask:
             "log_path": self.log_path,
             "manifest_path": self.manifest_path,
             "drive_folder_url": self.drive_folder_url,
+            "last_url": self.last_url,
             "progress_message": self.progress_message,
             "current_step": self.current_step,
+            "stop_requested": self.stop_requested,
+            "stop_requested_at": self.stop_requested_at.isoformat() if self.stop_requested_at else None,
         }
 
     @classmethod
@@ -82,8 +88,11 @@ class FunnelTask:
             log_path=row[11],
             manifest_path=row[12],
             drive_folder_url=row[13],
-            progress_message=row[14] or "",
-            current_step=row[15] or 0,
+            last_url=row[14],
+            progress_message=row[15] or "",
+            current_step=row[16] or 0,
+            stop_requested=bool(row[17]) if len(row) > 17 else False,
+            stop_requested_at=datetime.fromisoformat(row[18]) if len(row) > 18 and row[18] else None,
         )
 
 
@@ -116,10 +125,26 @@ class TaskManager:
                 log_path TEXT,
                 manifest_path TEXT,
                 drive_folder_url TEXT,
+                last_url TEXT,
                 progress_message TEXT DEFAULT '',
-                current_step INTEGER DEFAULT 0
+                current_step INTEGER DEFAULT 0,
+                stop_requested INTEGER DEFAULT 0,
+                stop_requested_at TEXT
             )
         """)
+
+        cursor.execute("PRAGMA table_info(tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if "last_url" not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN last_url TEXT")
+        if "progress_message" not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN progress_message TEXT DEFAULT ''")
+        if "current_step" not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN current_step INTEGER DEFAULT 0")
+        if "stop_requested" not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN stop_requested INTEGER DEFAULT 0")
+        if "stop_requested_at" not in existing_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN stop_requested_at TEXT")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS url_queue (
@@ -215,6 +240,31 @@ class TaskManager:
 
         return [FunnelTask.from_row(row) for row in rows]
 
+    async def get_tasks_by_statuses(
+        self,
+        user_id: int,
+        statuses: Sequence[TaskStatus],
+        limit: int = 100,
+    ) -> List[FunnelTask]:
+        """Получение задач пользователя по списку статусов."""
+        if not statuses:
+            return []
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        placeholders = ", ".join("?" for _ in statuses)
+        cursor.execute(f"""
+            SELECT * FROM tasks
+            WHERE user_id = ? AND status IN ({placeholders})
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (user_id, *[status.value for status in statuses], limit))
+
+        rows = cursor.fetchall()
+        conn.close()
+        return [FunnelTask.from_row(row) for row in rows]
+
     async def update_status(self, task_id: int, status: TaskStatus) -> None:
         """Обновление статуса задачи"""
         async with self._lock:
@@ -227,6 +277,8 @@ class TaskManager:
             if status == TaskStatus.PROCESSING:
                 updates.append("started_at = ?")
                 params.append(datetime.now().isoformat())
+                updates.append("stop_requested = 0")
+                updates.append("stop_requested_at = NULL")
             elif status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
                 updates.append("completed_at = ?")
                 params.append(datetime.now().isoformat())
@@ -241,18 +293,26 @@ class TaskManager:
             conn.commit()
             conn.close()
 
-    async def update_progress(self, task_id: int, current_step: int, 
-                              total_steps: int, message: str = "") -> None:
+    async def update_progress(self, task_id: int, current_step: int,
+                              total_steps: int, message: str = "",
+                              last_url: Optional[str] = None) -> None:
         """Обновление прогресса задачи"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
-            cursor.execute("""
-                UPDATE tasks 
-                SET current_step = ?, steps_total = ?, progress_message = ?
+            updates = ["current_step = ?", "steps_total = ?", "progress_message = ?"]
+            params: List[Any] = [current_step, total_steps, message]
+            if last_url is not None:
+                updates.append("last_url = ?")
+                params.append(last_url)
+            params.append(task_id)
+
+            cursor.execute(f"""
+                UPDATE tasks
+                SET {', '.join(updates)}
                 WHERE id = ?
-            """, (current_step, total_steps, message, task_id))
+            """, params)
 
             conn.commit()
             conn.close()
@@ -262,7 +322,10 @@ class TaskManager:
                            screenshot_path: Optional[str] = None,
                            log_path: Optional[str] = None,
                            manifest_path: Optional[str] = None,
-                           drive_folder_url: Optional[str] = None) -> None:
+                           drive_folder_url: Optional[str] = None,
+                            last_url: Optional[str] = None,
+                            final_status: Optional[TaskStatus] = None,
+                            progress_message: Optional[str] = None) -> None:
         """Завершение задачи с результатами"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
@@ -273,10 +336,11 @@ class TaskManager:
                 SET status = ?, completed_at = ?, steps_total = ?, 
                     paywall_reached = ?, error = ?, 
                     screenshot_path = ?, log_path = ?, 
-                    manifest_path = ?, drive_folder_url = ?
+                    manifest_path = ?, drive_folder_url = ?,
+                    last_url = ?, progress_message = ?, stop_requested = 0
                 WHERE id = ?
             """, (
-                TaskStatus.FAILED.value if error else TaskStatus.COMPLETED.value,
+                (final_status or (TaskStatus.FAILED if error else TaskStatus.COMPLETED)).value,
                 datetime.now().isoformat(),
                 steps_total,
                 paywall_reached,
@@ -285,6 +349,8 @@ class TaskManager:
                 log_path,
                 manifest_path,
                 drive_folder_url,
+                last_url,
+                progress_message or "",
                 task_id,
             ))
 
@@ -292,29 +358,78 @@ class TaskManager:
             conn.close()
 
     async def cancel_task(self, task_id: int) -> bool:
-        """Отмена задачи"""
+        """Совместимость: перенаправляет на мягкую остановку задачи."""
+        return await self.request_stop(task_id)
+
+    async def request_stop(self, task_id: int) -> bool:
+        """Запрашивает остановку задачи с сохранением текущего состояния."""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
-            # Можно отменить только pending или processing задачи
-            cursor.execute("""
-                UPDATE tasks 
-                SET status = ?, completed_at = ?
-                WHERE id = ? AND status IN (?, ?)
-            """, (
-                TaskStatus.CANCELLED.value,
-                datetime.now().isoformat(),
-                task_id,
-                TaskStatus.PENDING.value,
-                TaskStatus.PROCESSING.value,
-            ))
+            cursor.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            if not row:
+                conn.close()
+                return False
+
+            status = TaskStatus(row[0])
+            now = datetime.now().isoformat()
+
+            if status == TaskStatus.PENDING:
+                cursor.execute("""
+                    UPDATE tasks
+                    SET status = ?, completed_at = ?, stop_requested = 0,
+                        stop_requested_at = ?, progress_message = ?
+                    WHERE id = ?
+                """, (
+                    TaskStatus.CANCELLED.value,
+                    now,
+                    now,
+                    "Остановлено до запуска",
+                    task_id,
+                ))
+            elif status == TaskStatus.PROCESSING:
+                cursor.execute("""
+                    UPDATE tasks
+                    SET stop_requested = 1, stop_requested_at = ?, progress_message = ?
+                    WHERE id = ?
+                """, (
+                    now,
+                    "Запрошена остановка, ожидается безопасное завершение текущего шага",
+                    task_id,
+                ))
+            else:
+                conn.close()
+                return False
 
             affected = cursor.rowcount
             conn.commit()
             conn.close()
 
             return affected > 0
+
+    async def request_stop_for_user_active_tasks(self, user_id: int) -> List[int]:
+        """Запрашивает остановку всех активных задач пользователя."""
+        active_tasks = await self.get_tasks_by_statuses(
+            user_id,
+            [TaskStatus.PENDING, TaskStatus.PROCESSING],
+            limit=100,
+        )
+        stopped_ids: List[int] = []
+        for task in active_tasks:
+            if await self.request_stop(task.id):
+                stopped_ids.append(task.id)
+        return stopped_ids
+
+    async def is_stop_requested(self, task_id: int) -> bool:
+        """Проверяет, запрошена ли остановка для задачи."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT stop_requested FROM tasks WHERE id = ?", (task_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return bool(row and row[0])
 
     async def get_active_task_count(self) -> int:
         """Получение количества активных задач"""

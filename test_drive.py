@@ -44,6 +44,9 @@ def test_config():
     print(f"Google Drive включен: {cfg.google_drive.enabled}")
     print(f"Файл учетных данных: {cfg.google_drive.credentials_file}")
     print(f"Folder ID: {cfg.google_drive.folder_id or '(не указан)'}")
+    print(f"Token file: {cfg.google_drive.token_file}")
+    print(f"Root folder name: {cfg.google_drive.root_folder_name or '(не указано)'}")
+    print(f"Max parallel uploads: {cfg.google_drive.max_parallel_uploads}")
     
     if not cfg.google_drive.enabled:
         print_result(False, "Google Drive отключен в config.json")
@@ -62,18 +65,34 @@ def test_config():
         with open(cfg.google_drive.credentials_file, 'r') as f:
             creds = json.load(f)
         
-        required_fields = ['type', 'project_id', 'private_key_id', 'private_key', 
-                          'client_email', 'client_id', 'auth_uri', 'token_uri']
-        
-        missing_fields = [f for f in required_fields if f not in creds]
-        
-        if missing_fields:
-            print_result(False, f"Отсутствуют поля в credentials: {missing_fields}")
-            success = False
+        is_service_account = creds.get('type') == 'service_account'
+        is_oauth_client = 'installed' in creds or 'web' in creds
+
+        if is_service_account:
+            required_fields = ['type', 'project_id', 'private_key_id', 'private_key',
+                              'client_email', 'client_id', 'auth_uri', 'token_uri']
+            missing_fields = [f for f in required_fields if f not in creds]
+            if missing_fields:
+                print_result(False, f"Отсутствуют поля в service account credentials: {missing_fields}")
+                success = False
+            else:
+                print_result(True, "Service account credentials файл валиден")
+                print(f"  Project ID: {creds.get('project_id', 'N/A')}")
+                print(f"  Client Email: {creds.get('client_email', 'N/A')}")
+        elif is_oauth_client:
+            oauth_section = creds.get('installed') or creds.get('web') or {}
+            required_fields = ['client_id', 'project_id', 'auth_uri', 'token_uri']
+            missing_fields = [f for f in required_fields if f not in oauth_section]
+            if missing_fields:
+                print_result(False, f"Отсутствуют поля в OAuth credentials: {missing_fields}")
+                success = False
+            else:
+                print_result(True, "OAuth credentials файл валиден")
+                print(f"  Project ID: {oauth_section.get('project_id', 'N/A')}")
+                print(f"  Client ID: {oauth_section.get('client_id', 'N/A')}")
         else:
-            print_result(True, "Credentials файл содержит все необходимые поля")
-            print(f"  Project ID: {creds.get('project_id', 'N/A')}")
-            print(f"  Client Email: {creds.get('client_email', 'N/A')}")
+            print_result(False, "Неизвестный формат Google credentials файла")
+            success = False
     
     except json.JSONDecodeError as e:
         print_result(False, f"Невалидный JSON в credentials файле: {e}")
@@ -312,6 +331,8 @@ def main():
     print(f"  Config file: config.json")
     print(f"  Credentials: {cfg.google_drive.credentials_file}")
     print(f"  Folder ID: {cfg.google_drive.folder_id or '(не указан)'}")
+    print(f"  Token file: {cfg.google_drive.token_file}")
+    print(f"  Root folder name: {cfg.google_drive.root_folder_name or '(не указано)'}")
     print(f"  Enabled: {cfg.google_drive.enabled}")
     
     # Счетчик тестов

@@ -1,4 +1,10 @@
-# Инструкция по настройке Google Drive API (OAuth 2.0)
+# Инструкция по настройке Google Drive API
+
+Проект поддерживает два варианта авторизации:
+- OAuth desktop client — удобно для запуска от вашего Google-аккаунта;
+- service account — подходит для серверного режима без ручной авторизации, если папка заранее расшарена на service account.
+
+Рекомендуемый вариант для локального использования — OAuth desktop client.
 
 ## Шаг 1: Создание проекта в Google Cloud Console
 
@@ -42,6 +48,16 @@
 6. Скачайте JSON файл с учетными данными
 7. Переименуйте файл в `client_secret.json`
 
+### Альтернатива: Service Account
+
+Если нужен полностью безголовый режим без ручного логина:
+
+1. В Google Cloud Console откройте **"IAM & Admin"** → **"Service Accounts"**
+2. Создайте service account
+3. Создайте JSON key и скачайте файл
+4. Сохраните его в проект, например как `credentials.json`
+5. Если будете загружать в существующую папку Google Drive, расшарьте эту папку на email service account
+
 ## Шаг 5: Копирование файла с учетными данными
 
 1. Скопируйте `client_secret.json` в директорию проекта:
@@ -51,22 +67,36 @@
 
 ## Шаг 6: Настройка конфигурации
 
-Откройте `config.json` и заполните секцию `google_drive`:
+Откройте `.env` и/или `config.json` и заполните секцию `google_drive`:
 
 ```json
 {
   "google_drive": {
     "enabled": true,
     "credentials_file": "client_secret.json",
-    "folder_id": ""
+    "token_file": "token.json",
+    "folder_id": "",
+    "root_folder_name": "Quiz Funnel Runner Results"
   }
 }
 ```
 
 Параметры:
 - `enabled`: `true` для включения интеграции
-- `credentials_file`: путь к файлу `client_secret.json`
-- `folder_id`: ID папки для загрузки (опционально, если пусто - файлы загружаются в корень вашего Drive)
+- `credentials_file`: путь к OAuth client JSON или service account JSON
+- `token_file`: путь к файлу с OAuth токеном; для service account не используется
+- `folder_id`: ID папки для загрузки; если пусто, будет использована или создана папка по `root_folder_name`
+- `root_folder_name`: имя корневой папки, которую проект создаст или переиспользует автоматически
+
+Рекомендуется хранить значения в `.env`:
+
+```ini
+GOOGLE_DRIVE_ENABLED=true
+GOOGLE_DRIVE_CREDENTIALS_FILE=client_secret.json
+GOOGLE_DRIVE_TOKEN_FILE=token.json
+GOOGLE_DRIVE_FOLDER_ID=
+GOOGLE_DRIVE_ROOT_FOLDER_NAME=Quiz Funnel Runner Results
+```
 
 ### Как получить folder_id (опционально)
 
@@ -84,14 +114,16 @@ pip install -r requirements.txt
 
 ## Шаг 8: Первая авторизация
 
-При первом запуске бота или теста откроется браузер с запросом доступа:
+Для OAuth desktop client при первом запуске бота или теста откроется браузер с запросом доступа:
 
 1. Выберите ваш Google аккаунт
 2. Нажмите **"Allow"** для предоставления доступа
 3. Браузер покажет **"The authentication flow has completed"**
-4. Токен сохранится в файле `token.pickle`
+4. Токен сохранится в файле `token.json`
 
-**Важно:** Токен обновляется автоматически. При проблемах удалите `token.pickle` для повторной авторизации.
+**Важно:** Токен обновляется автоматически. При проблемах удалите `token.json` для повторной авторизации.
+
+Для service account этот шаг не нужен.
 
 ## Шаг 9: Проверка работы
 
@@ -144,8 +176,14 @@ Google Drive/
 - Проверьте путь в `config.json`
 
 ### Ошибка "Token expired"
-- Удалите файл `token.pickle`
+- Удалите файл `token.json`
 - Запустите тест заново для повторной авторизации
+
+### Ошибка 403 / 429 / quota exceeded
+- Подождите и повторите позже: проект уже использует retry/backoff для временных ограничений
+- Проверьте, не слишком ли часто создаются новые папки и не перезаливаются ли те же файлы
+- Для существующей папки задайте `GOOGLE_DRIVE_FOLDER_ID`, чтобы сократить лишние запросы на поиск/создание
+- Для server-side сценариев рассмотрите service account и заранее расшаренную папку
 
 ### Ошибка "The OAuth consent screen is not configured"
 - Настройте OAuth consent screen (Шаг 3)
@@ -155,7 +193,7 @@ Google Drive/
 
 ⚠️ **Никогда не коммитьте следующие файлы в Git:**
 - `client_secret.json`
-- `token.pickle`
+- `token.json`
 - `.env`
 
 Файл `.gitignore` уже содержит эти файлы для безопасности.
@@ -166,10 +204,10 @@ Google Drive/
 
 ```bash
 # Windows
-del token.pickle
+del token.json
 
 # Linux/Mac
-rm token.pickle
+rm token.json
 ```
 
 Затем запустите бота или тест заново.

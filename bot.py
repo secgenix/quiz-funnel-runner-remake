@@ -3,15 +3,18 @@ Telegram бот для Quiz Funnel Runner
 Интеграция с aiogram 3.x
 """
 import asyncio
+import contextlib
 import logging
 import os
 import re
+import signal
 import shutil
+import threading
 import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -32,42 +35,14 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import get_config, init_config
 from models import TaskManager, FunnelTask, TaskStatus
-from drive_uploader import GoogleDriveUploader
+from drive_uploader import GoogleDriveUploader, ParallelDriveUploadManager
 from google_links_reader import GoogleLinksReader, is_google_url
 
-# Импортируем функции из main.py
-from main import (
-    run_funnel,
-    get_slug,
-    classify_screen,
-    perform_action,
-    close_popups,
-    get_screen_hash,
-    get_ui_step,
-    wait_for_transition,
-    find_continue_button,
-    warmup_page_for_full_screenshot,
-    ensure_privacy_checkbox_checked,
-    ensure_consent_checkbox_checked,
-    is_probable_paywall_url,
-    resolve_fill_values,
-    FILLABLE_INPUT_SELECTOR,
-    DEBUG_CLASSIFY,
-    WORKOUT_ISSUES_STEP_KEY,
-    WORKOUT_FREQUENCY_STEP_KEY,
-    DATE_OF_BIRTH_STEP_KEY,
-    save_error_artifacts,
-    check_and_handle_form_blockers,
-    detect_page_stuck_state,
-    detect_url_loop,
-)
+from runner import get_slug, load_runner_config, run_funnel
 
-from playwright.sync_api import sync_playwright, Page, TimeoutError
-from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import json
-import hashlib
-import argparse
 
 # Настройка логирования
 logging.basicConfig(
@@ -81,6 +56,8 @@ bot: Optional[Bot] = None
 dp: Optional[Dispatcher] = None
 task_manager: Optional[TaskManager] = None
 thread_pool: Optional[ThreadPoolExecutor] = None
+drive_upload_executor: Optional[ThreadPoolExecutor] = None
+drive_upload_manager: Optional[ParallelDriveUploadManager] = None
 
 
 class ErrorData:
@@ -183,6 +160,206 @@ class ErrorCollector:
 # Глобальный коллектор ошибок
 error_collector: Optional[ErrorCollector] = None
 
+
+class DriveUploadJob:
+    """Задача фоновой загрузки результатов в Google Drive."""
+
+    def __init__(
+        self,
+        task_id: int,
+        user_id: int,
+        slug: str,
+        result_dir: str,
+        credentials_file: str,
+        folder_id: str,
+        token_file: str,
+        root_folder_name: str,
+    ):
+        self.task_id = task_id
+        self.user_id = user_id
+        self.slug = slug
+        self.result_dir = result_dir
+        self.credentials_file = credentials_file
+        self.folder_id = folder_id
+        self.token_file = token_file
+        self.root_folder_name = root_folder_name
+
+
+class DriveUploadQueue:
+    """Фоновая очередь загрузки артефактов в Google Drive."""
+
+    def __init__(self):
+        self.queue: asyncio.Queue[Optional[DriveUploadJob]] = asyncio.Queue()
+        self._workers: List[asyncio.Task] = []
+        self._inflight: Set[int] = set()
+        self._lock = asyncio.Lock()
+        self._running = False
+
+    async def start(self, workers: int) -> None:
+        if self._running:
+            return
+        self._running = True
+        worker_count = max(1, int(workers))
+        self._workers = [
+            asyncio.create_task(self._worker_loop(idx + 1))
+            for idx in range(worker_count)
+        ]
+        logger.info(f"☁️ Фоновая очередь Google Drive запущена, workers={worker_count}")
+
+    async def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+        for _ in self._workers:
+            await self.queue.put(None)
+        await self.queue.join()
+        for worker in self._workers:
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+        self._workers.clear()
+        logger.info("☁️ Фоновая очередь Google Drive остановлена")
+
+    async def force_stop(self) -> Dict[str, int]:
+        """Немедленно прекращает приём новых задач и очищает все ещё не начавшиеся jobs."""
+        self._running = False
+        cleared_jobs = 0
+        while True:
+            try:
+                queued_job = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if queued_job is not None:
+                cleared_jobs += 1
+            self.queue.task_done()
+
+        workers = list(self._workers)
+        for _ in workers:
+            await self.queue.put(None)
+        for worker in workers:
+            try:
+                await asyncio.wait_for(worker, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                worker.cancel()
+        self._workers.clear()
+        logger.info("☁️ Фоновая очередь Google Drive принудительно остановлена, cleared_jobs=%s", cleared_jobs)
+        return {
+            "cleared_jobs": cleared_jobs,
+            "active_jobs": len(self._inflight),
+        }
+
+    async def enqueue(self, job: DriveUploadJob) -> bool:
+        async with self._lock:
+            if job.task_id in self._inflight:
+                logger.info(f"Google Drive upload уже запланирован для task_id={job.task_id}")
+                return False
+            self._inflight.add(job.task_id)
+        await self.queue.put(job)
+        logger.info(f"Google Drive upload поставлен в фон для task_id={job.task_id}, slug={job.slug}")
+        return True
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        while True:
+            job = await self.queue.get()
+            if job is None:
+                self.queue.task_done()
+                break
+            try:
+                await self._process_job(job, worker_id)
+            except Exception as e:
+                logger.error(f"Ошибка фоновой Google Drive загрузки task_id={job.task_id}: {e}")
+            finally:
+                async with self._lock:
+                    self._inflight.discard(job.task_id)
+                self.queue.task_done()
+
+    async def _process_job(self, job: DriveUploadJob, worker_id: int) -> None:
+        logger.info(
+            f"Google Drive worker #{worker_id}: начало загрузки task_id={job.task_id}, slug={job.slug}"
+        )
+        drive_url = await upload_to_google_drive(
+            slug=job.slug,
+            result_dir=job.result_dir,
+            credentials_file=job.credentials_file,
+            folder_id=job.folder_id,
+            token_file=job.token_file,
+            root_folder_name=job.root_folder_name,
+        )
+        if not drive_url:
+            logger.warning(
+                f"Google Drive worker #{worker_id}: загрузка завершилась без ссылки task_id={job.task_id}"
+            )
+            return
+
+        task = await task_manager.get_task(job.task_id)
+        if not task:
+            logger.warning(f"Google Drive worker #{worker_id}: задача task_id={job.task_id} не найдена в БД")
+            return
+
+        await task_manager.complete_task(
+            task_id=task.id,
+            steps_total=task.steps_total,
+            paywall_reached=task.paywall_reached,
+            error=task.error,
+            screenshot_path=task.screenshot_path,
+            log_path=task.log_path,
+            manifest_path=task.manifest_path,
+            drive_folder_url=drive_url,
+            last_url=task.last_url,
+        )
+        logger.info(
+            f"Google Drive worker #{worker_id}: ссылка сохранена для task_id={job.task_id}: {drive_url}"
+        )
+
+
+drive_upload_queue: Optional[DriveUploadQueue] = None
+
+
+class TaskStopRegistry:
+    """Потокобезопасный реестр запросов на остановку запущенных задач."""
+
+    def __init__(self):
+        self._events: Dict[int, threading.Event] = {}
+        self._user_tasks: Dict[int, Set[int]] = defaultdict(set)
+        self._lock = threading.Lock()
+
+    def register(self, task_id: int, user_id: int) -> threading.Event:
+        with self._lock:
+            event = threading.Event()
+            self._events[task_id] = event
+            self._user_tasks[user_id].add(task_id)
+            return event
+
+    def unregister(self, task_id: int, user_id: int) -> None:
+        with self._lock:
+            self._events.pop(task_id, None)
+            if user_id in self._user_tasks:
+                self._user_tasks[user_id].discard(task_id)
+                if not self._user_tasks[user_id]:
+                    self._user_tasks.pop(user_id, None)
+
+    def request_stop(self, task_id: int) -> bool:
+        with self._lock:
+            event = self._events.get(task_id)
+            if not event:
+                return False
+            event.set()
+            return True
+
+    def request_stop_for_user(self, user_id: int) -> int:
+        with self._lock:
+            task_ids = list(self._user_tasks.get(user_id, set()))
+            for task_id in task_ids:
+                event = self._events.get(task_id)
+                if event:
+                    event.set()
+            return len(task_ids)
+
+
+task_stop_registry = TaskStopRegistry()
+
 # Пакетные уведомления о старте задач (для сообщений с несколькими URL)
 start_batch_notifications: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
 start_batch_lock = asyncio.Lock()
@@ -200,9 +377,10 @@ class FormStates(StatesGroup):
 MENU_BUTTONS_MAP = {
     "📊 Статус": "/status",
     "📜 История": "/history",
-    "⛔ Отмена": "/cancel",
+    "⛔ Стоп все": "/cancel",
     "🧹 Очистить": "/clear",
     "📁 Drive": "/drive",
+    "🛑 Drive стоп": "/drive_stop",
     "ℹ️ Помощь": "/help",
 }
 
@@ -212,12 +390,67 @@ def build_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Статус"), KeyboardButton(text="📜 История")],
-            [KeyboardButton(text="⛔ Отмена"), KeyboardButton(text="🧹 Очистить")],
-            [KeyboardButton(text="📁 Drive"), KeyboardButton(text="ℹ️ Помощь")],
+            [KeyboardButton(text="⛔ Стоп все"), KeyboardButton(text="🧹 Очистить")],
+            [KeyboardButton(text="📁 Drive"), KeyboardButton(text="🛑 Drive стоп")],
+            [KeyboardButton(text="ℹ️ Помощь")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Вставьте URL или выберите действие из меню",
     )
+
+
+def build_drive_controls():
+    """Inline-кнопка принудительной остановки Drive upload."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛑 Остановить Drive upload", callback_data="stop_drive_uploads")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def stop_drive_uploads(force_reason: str) -> Dict[str, int]:
+    """Принудительно останавливает дальнейшие загрузки в Google Drive и очищает очередь."""
+    result = {
+        "drive_queue_cleared": 0,
+        "drive_queue_active": 0,
+        "manager_cleared": 0,
+        "manager_entries_cancelled": 0,
+        "manager_active": 0,
+        "runs_affected": 0,
+    }
+
+    if drive_upload_queue:
+        stats = await drive_upload_queue.force_stop()
+        result["drive_queue_cleared"] = int(stats.get("cleared_jobs", 0))
+        result["drive_queue_active"] = int(stats.get("active_jobs", 0))
+
+    if drive_upload_manager:
+        stats = drive_upload_manager.cancel_pending(reason=force_reason)
+        result["manager_cleared"] = int(stats.get("cleared_tasks", 0))
+        result["manager_entries_cancelled"] = int(stats.get("queued_entries_cancelled", 0))
+        result["manager_active"] = int(stats.get("active_uploads", 0))
+        result["runs_affected"] = int(stats.get("runs_affected", 0))
+
+    return result
+
+
+def build_active_task_controls(tasks: List[FunnelTask]):
+    """Inline-кнопки для остановки активных задач."""
+    active_tasks = [t for t in tasks if t.status in (TaskStatus.PENDING, TaskStatus.PROCESSING)]
+    if not active_tasks:
+        return None
+
+    builder = InlineKeyboardBuilder()
+    if len(active_tasks) > 1:
+        builder.button(text="⛔ Остановить все активные", callback_data="stop_all")
+
+    for task in active_tasks[:8]:
+        label = f"⛔ Стоп #{task.id}"
+        if getattr(task, "stop_requested", False):
+            label = f"🛑 Ожидает #{task.id}"
+        builder.button(text=label, callback_data=f"stop_task_{task.id}")
+
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 def short_url(url: str, max_len: int = 60) -> str:
@@ -225,6 +458,87 @@ def short_url(url: str, max_len: int = 60) -> str:
     if not url:
         return "-"
     return url if len(url) <= max_len else f"{url[:max_len - 1]}…"
+
+
+def normalize_url_for_compare(url: Optional[str]) -> str:
+    """Нормализует URL для сравнения без лишнего шума."""
+    if not url:
+        return ""
+    normalized = str(url).strip()
+    if not normalized:
+        return ""
+    return normalized.rstrip("/")
+
+
+def should_show_resume_url(start_url: Optional[str], current_url: Optional[str]) -> bool:
+    """Показывает resume URL только если он действительно отличается от стартового."""
+    start_norm = normalize_url_for_compare(start_url)
+    current_norm = normalize_url_for_compare(current_url)
+    return bool(current_norm and current_norm != start_norm)
+
+
+def format_error_summary(error: Optional[str]) -> str:
+    """Краткая, человеко-понятная сводка ошибки без технического шума."""
+    raw = (error or "").strip()
+    if not raw:
+        return "Ошибка выполнения"
+
+    mappings = {
+        "navigation_timeout": "Страница не открылась вовремя",
+        "stuck_loop": "Сценарий зациклился",
+        "Task stuck, cleared by user": "Задача была сброшена вручную",
+    }
+    if raw in mappings:
+        return mappings[raw]
+
+    if raw.startswith("runner_exception:"):
+        details = raw.split(":", 1)[1].strip()
+        return f"Сбой раннера: {details}" if details else "Сбой раннера"
+
+    compact = raw.replace("_", " ")
+    return compact[:160]
+
+
+def build_result_lines(task: FunnelTask, *, is_success: bool, resume_url: Optional[str] = None) -> List[str]:
+    """Единый компактный формат итоговых сообщений."""
+    lines: List[str] = []
+
+    if is_success:
+        lines.append("✅ <b>Успех</b>")
+        if task.paywall_reached:
+            lines.append("💳 Paywall найден")
+        else:
+            lines.append("📄 Сценарий завершен")
+    else:
+        lines.append("❌ <b>Ошибка</b>")
+        lines.append(f"⚠️ {format_error_summary(task.error)}")
+
+    lines.append(f"#️⃣ <b>#{task.id}</b>")
+    lines.append(f"🔗 <code>{short_url(task.url, 85)}</code>")
+
+    meta_parts: List[str] = []
+    if task.steps_total:
+        meta_parts.append(f"шагов: {task.steps_total}")
+    if task.completed_at:
+        duration = task.completed_at - (task.started_at or task.created_at)
+        meta_parts.append(f"{duration.total_seconds():.1f} сек")
+    if meta_parts:
+        lines.append(f"⏱ {' • '.join(meta_parts)}")
+
+    if resume_url:
+        lines.append(f"↩️ <a href='{resume_url}'>Продолжить с текущего места</a>")
+
+    if task.drive_folder_url:
+        lines.append(f"📁 <a href='{task.drive_folder_url}'>Drive</a>")
+
+    if is_success:
+        lines.append("📎 Скриншот: финальный экран")
+
+    return lines
+
+
+def build_result_text(task: FunnelTask, *, is_success: bool, resume_url: Optional[str] = None) -> str:
+    return "\n".join(build_result_lines(task, is_success=is_success, resume_url=resume_url))
 
 
 def find_paywall_screenshot(task: FunnelTask) -> Optional[str]:
@@ -318,9 +632,13 @@ def is_valid_url(url: str) -> bool:
 def check_user_access(user_id: int) -> bool:
     """Проверка доступа пользователя"""
     cfg = get_config()
+    if user_id in cfg.bot.admin_ids:
+        return True
+
     if cfg.bot.use_only_admin:
-        return user_id in cfg.bot.admin_ids
-    return user_id in cfg.bot.allowed_users or user_id in cfg.bot.admin_ids
+        return False
+
+    return True
 
 
 async def get_task_status_text(task: FunnelTask) -> str:
@@ -346,6 +664,14 @@ async def get_task_status_text(task: FunnelTask) -> str:
 
     if task.status == TaskStatus.PROCESSING:
         text += f"🔄 Шаг: {task.current_step}/{task.steps_total}\n"
+        if task.progress_message:
+            text += f"<i>{short_url(task.progress_message, 80)}</i>\n"
+        if getattr(task, "stop_requested", False):
+            text += "🛑 Остановка уже запрошена\n"
+
+    if task.status == TaskStatus.CANCELLED:
+        if task.current_step:
+            text += f"🧭 Выполнено шагов: {task.current_step}\n"
         if task.progress_message:
             text += f"<i>{short_url(task.progress_message, 80)}</i>\n"
 
@@ -374,7 +700,7 @@ async def notify_task_start(bot: Bot, user_id: int, task: FunnelTask) -> None:
             f"🚀 Запущена задача <b>#{task.id}</b>\n"
             f"🔗 <code>{short_url(task.url)}</code>",
             parse_mode="HTML",
-            reply_markup=build_main_menu(),
+            reply_markup=build_active_task_controls([task]) or build_main_menu(),
         )
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления о старте: {e}")
@@ -385,7 +711,7 @@ async def notify_batch_start(bot: Bot, user_id: int, total_tasks: int) -> None:
     try:
         await bot.send_message(
             user_id,
-            f"🚀 Запуск задач: <b>{total_tasks}</b>",
+            f"🚀 <b>Запуск</b> • задач: {total_tasks}",
             parse_mode="HTML",
             reply_markup=build_main_menu(),
         )
@@ -401,7 +727,7 @@ async def notify_task_progress(bot: Bot, user_id: int, task: FunnelTask) -> None
             await bot.send_message(
                 user_id,
                 f"🔄 <b>#{task.id}</b> • {task.current_step}/{task.steps_total}\n"
-                f"{short_url(task.progress_message or '', 90)}",
+                f"{short_url(task.progress_message or 'Выполняется…', 90)}",
                 parse_mode="HTML",
                 reply_markup=build_main_menu(),
             )
@@ -412,7 +738,7 @@ async def notify_task_progress(bot: Bot, user_id: int, task: FunnelTask) -> None
 async def notify_task_complete(bot: Bot, user_id: int, task: FunnelTask) -> None:
     """Уведомление о завершении задачи"""
     try:
-        text = f"✅ <b>Готово</b>\n" + await get_task_status_text(task)
+        text = build_result_text(task, is_success=True)
 
         # Для успешного прохождения отправляем именно paywall/checkout скриншот (если найден)
         screenshot_to_send = task.screenshot_path
@@ -435,10 +761,25 @@ async def notify_task_complete(bot: Bot, user_id: int, task: FunnelTask) -> None
 
 
 async def notify_task_error(bot: Bot, user_id: int, task: FunnelTask, error: str) -> None:
-    """Сохранение ошибки в коллектор (без отправки в Telegram)"""
+    """Компактное уведомление об ошибке + сохранение в коллектор."""
     try:
-        # Не отправляем уведомление в Telegram, только логируем
         logger.warning(f"Ошибка задачи #{task.id}: {error[:200]}")
+
+        resume_url: Optional[str] = None
+        task_last_url = getattr(task, "last_url", None)
+        if should_show_resume_url(task.url, task_last_url):
+            resume_url = task_last_url
+
+        text = build_result_text(task, is_success=False, resume_url=resume_url)
+
+        if task.screenshot_path and os.path.exists(task.screenshot_path):
+            try:
+                photo = FSInputFile(task.screenshot_path)
+                await bot.send_photo(user_id, photo, caption=text, parse_mode="HTML", reply_markup=build_main_menu())
+            except Exception:
+                await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=build_main_menu())
+        else:
+            await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=build_main_menu())
         
         # Сохраняем в коллектор ошибок
         if error_collector:
@@ -450,6 +791,49 @@ async def notify_task_error(bot: Bot, user_id: int, task: FunnelTask, error: str
             )
     except Exception as e:
         logger.error(f"Ошибка при сохранении ошибки в коллектор: {e}")
+
+
+async def notify_task_cancelled(bot: Bot, user_id: int, task: FunnelTask) -> None:
+    """Уведомление о корректной остановке задачи с частичным результатом."""
+    try:
+        resume_url: Optional[str] = None
+        task_last_url = getattr(task, "last_url", None)
+        if should_show_resume_url(task.url, task_last_url):
+            resume_url = task_last_url
+
+        lines = [
+            "⛔ <b>Остановлено</b>",
+            f"#️⃣ <b>#{task.id}</b>",
+            f"🔗 <code>{short_url(task.url, 85)}</code>",
+        ]
+        meta_parts: List[str] = []
+        if task.current_step:
+            meta_parts.append(f"выполнено шагов: {task.current_step}")
+        if task.completed_at:
+            duration = task.completed_at - (task.started_at or task.created_at)
+            meta_parts.append(f"{duration.total_seconds():.1f} сек")
+        if meta_parts:
+            lines.append(f"⏱ {' • '.join(meta_parts)}")
+        if task.progress_message:
+            lines.append(f"ℹ️ {task.progress_message}")
+        if resume_url:
+            lines.append(f"↩️ <a href='{resume_url}'>Продолжить с текущего места</a>")
+        if task.drive_folder_url:
+            lines.append(f"📁 <a href='{task.drive_folder_url}'>Drive</a>")
+
+        text = "\n".join(lines)
+
+        if task.screenshot_path and os.path.exists(task.screenshot_path):
+            try:
+                photo = FSInputFile(task.screenshot_path)
+                await bot.send_photo(user_id, photo, caption=text, parse_mode="HTML", reply_markup=build_main_menu())
+                return
+            except Exception:
+                pass
+
+        await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=build_main_menu())
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления об остановке: {e}")
 
 
 # ====================
@@ -496,7 +880,16 @@ async def cmd_status(message: Message) -> None:
 
     task = tasks[0]
     text = await get_task_status_text(task)
-    await message.answer(text, parse_mode="HTML", reply_markup=build_main_menu())
+    active_tasks = await task_manager.get_tasks_by_statuses(
+        user_id,
+        [TaskStatus.PENDING, TaskStatus.PROCESSING],
+        limit=20,
+    )
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=build_active_task_controls(active_tasks) or build_main_menu(),
+    )
 
 
 async def cmd_history(message: Message) -> None:
@@ -521,9 +914,20 @@ async def cmd_history(message: Message) -> None:
             TaskStatus.FAILED: "❌",
             TaskStatus.CANCELLED: "⛔",
         }
-        text += f"{i}) {status_emoji.get(task.status, '❓')} #{task.id} • <code>{short_url(task.url, 42)}</code>\n"
+        progress_suffix = ""
+        if task.status == TaskStatus.PROCESSING and task.current_step:
+            progress_suffix = f" • {task.current_step}/{task.steps_total}"
+        elif task.status == TaskStatus.CANCELLED and task.current_step:
+            progress_suffix = f" • остановлено на {task.current_step}"
+        if getattr(task, "stop_requested", False):
+            progress_suffix += " • 🛑 запрос остановки"
+        text += f"{i}) {status_emoji.get(task.status, '❓')} #{task.id} • <code>{short_url(task.url, 42)}</code>{progress_suffix}\n"
 
-    await message.answer(text, parse_mode="HTML", reply_markup=build_main_menu())
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=build_active_task_controls(tasks) or build_main_menu(),
+    )
 
 
 async def cmd_cancel(message: Message) -> None:
@@ -534,22 +938,27 @@ async def cmd_cancel(message: Message) -> None:
         await message.answer("❌ Доступ запрещен")
         return
 
-    # Получаем активные задачи
-    tasks = await task_manager.get_user_tasks(user_id, limit=1)
-    if not tasks:
-        await message.answer("📭 Нет активных задач для отмены.")
+    active_tasks = await task_manager.get_tasks_by_statuses(
+        user_id,
+        [TaskStatus.PENDING, TaskStatus.PROCESSING],
+        limit=100,
+    )
+    if not active_tasks:
+        await message.answer("📭 Нет активных задач для остановки.", reply_markup=build_main_menu())
         return
 
-    task = tasks[0]
-    if task.status not in (TaskStatus.PENDING, TaskStatus.PROCESSING):
-        await message.answer("ℹ️ Задача уже завершена.")
-        return
+    stopped_ids = await task_manager.request_stop_for_user_active_tasks(user_id)
+    task_stop_registry.request_stop_for_user(user_id)
 
-    cancelled = await task_manager.cancel_task(task.id)
-    if cancelled:
-        await message.answer(f"✅ Задача #{task.id} отменена.", reply_markup=build_main_menu())
+    if stopped_ids:
+        await message.answer(
+            f"⛔ Запрошена остановка задач: <b>{len(stopped_ids)}</b>\n"
+            "Выполняющиеся задачи завершат текущий безопасный шаг, сохранят результат и перейдут в историю.",
+            parse_mode="HTML",
+            reply_markup=build_main_menu(),
+        )
     else:
-        await message.answer("❌ Не удалось отменить задачу.", reply_markup=build_main_menu())
+        await message.answer("❌ Не удалось остановить активные задачи.", reply_markup=build_main_menu())
 
 
 async def cmd_clear(message: Message) -> None:
@@ -610,7 +1019,7 @@ async def cmd_drive(message: Message) -> None:
                 f"🧭 Шагов: {task.steps_total} • Paywall: {'✅' if task.paywall_reached else '❌'}\n\n"
                 f"🔗 <a href='{task.drive_folder_url}'>Открыть папку в Google Drive</a>",
                 parse_mode="HTML",
-                reply_markup=build_main_menu(),
+                reply_markup=build_drive_controls(),
             )
             return
 
@@ -625,8 +1034,40 @@ async def cmd_help(message: Message) -> None:
     """Обработка команды /help"""
     await message.answer(
         "ℹ️ <b>Команды:</b>\n"
-        "/status • /history • /cancel • /clear • /drive • /help\n\n"
+        "/status • /history • /cancel • /clear • /drive • /drive_stop • /help\n\n"
+        "⛔ /cancel — мягко остановить все активные задачи с сохранением промежуточного результата.\n"
+        "🛑 /drive_stop — принудительно остановить загрузку файлов в Google Drive и очистить незагруженную очередь.\n"
+        " В истории доступны кнопки точечной остановки отдельных задач.\n\n"
         "📝 Отправьте URL (или список URL) для запуска задач.",
+        parse_mode="HTML",
+        reply_markup=build_main_menu(),
+    )
+
+
+async def cmd_drive_stop(message: Message) -> None:
+    """Принудительная остановка загрузок в Google Drive и очистка очереди."""
+    user_id = message.from_user.id
+
+    if not check_user_access(user_id):
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
+        return
+
+    if not drive_upload_manager and not drive_upload_queue:
+        await message.answer(
+            "ℹ️ Google Drive загрузчик не запущен.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    stats = await stop_drive_uploads("Drive uploads stopped by user")
+    active_hint = max(int(stats.get("drive_queue_active", 0)), int(stats.get("manager_active", 0)))
+    await message.answer(
+        "🛑 <b>Google Drive upload остановлен</b>\n"
+        f"🧹 Удалено из внутренних очередей: <b>{int(stats.get('drive_queue_cleared', 0)) + int(stats.get('manager_cleared', 0))}</b>\n"
+        f"📄 Отменено незагруженных записей: <b>{int(stats.get('manager_entries_cancelled', 0))}</b>\n"
+        f"📁 Затронуто сессий: <b>{int(stats.get('runs_affected', 0))}</b>\n"
+        + (f"⏳ Уже начатых загрузок сейчас выполняется: <b>{active_hint}</b>\n" if active_hint else "")
+        + "Новые файлы в Drive в этой сессии больше не будут ставиться в очередь.",
         parse_mode="HTML",
         reply_markup=build_main_menu(),
     )
@@ -650,6 +1091,8 @@ async def handle_menu_buttons(message: Message, state: FSMContext) -> None:
         await cmd_clear(message)
     elif command == "/drive":
         await cmd_drive(message)
+    elif command == "/drive_stop":
+        await cmd_drive_stop(message)
     elif command == "/help":
         await cmd_help(message)
 
@@ -788,27 +1231,68 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
     """Обработка callback query"""
     data = callback.data
 
-    if data.startswith("cancel_"):
-        task_id = int(data.split("_")[1])
+    if data == "stop_all":
         user_id = callback.from_user.id
 
         if not check_user_access(user_id):
             await callback.answer("❌ Доступ запрещен", show_alert=True)
             return
 
-        cancelled = await task_manager.cancel_task(task_id)
-        if cancelled:
-            await callback.answer(f"✅ Задача #{task_id} отменена")
+        stopped_ids = await task_manager.request_stop_for_user_active_tasks(user_id)
+        task_stop_registry.request_stop_for_user(user_id)
+        if stopped_ids:
+            await callback.answer(f"⛔ Остановка запрошена для {len(stopped_ids)} задач")
         else:
-            await callback.answer("❌ Не удалось отменить задачу", show_alert=True)
+            await callback.answer("ℹ️ Активных задач не найдено", show_alert=True)
+        return
+
+    if data.startswith("stop_task_"):
+        task_id = int(data.split("_")[2])
+        user_id = callback.from_user.id
+
+        if not check_user_access(user_id):
+            await callback.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        task = await task_manager.get_task(task_id)
+        if not task or task.user_id != user_id:
+            await callback.answer("❌ Задача не найдена", show_alert=True)
+            return
+
+        stopped = await task_manager.request_stop(task_id)
+        task_stop_registry.request_stop(task_id)
+        if stopped:
+            await callback.answer(f"⛔ Остановка задачи #{task_id} запрошена")
+        else:
+            await callback.answer("ℹ️ Задача уже завершена", show_alert=True)
+
+    if data == "stop_drive_uploads":
+        user_id = callback.from_user.id
+
+        if not check_user_access(user_id):
+            await callback.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        stats = await stop_drive_uploads("Drive uploads stopped from Telegram callback")
+        await callback.answer(
+            f"🛑 Drive queue cleared: {int(stats.get('drive_queue_cleared', 0)) + int(stats.get('manager_cleared', 0))}",
+            show_alert=True,
+        )
+        return
 
 
 # ====================
 # Google Drive загрузка
 # ====================
 
-async def upload_to_google_drive(slug: str, result_dir: str, 
-                                 credentials_file: str, folder_id: str) -> Optional[str]:
+def upload_to_google_drive_sync(
+    slug: str,
+    result_dir: str,
+    credentials_file: str,
+    folder_id: str,
+    token_file: str = "token.json",
+    root_folder_name: str = "",
+) -> Optional[str]:
     """
     Загрузка результатов воронки в Google Drive
     
@@ -822,32 +1306,56 @@ async def upload_to_google_drive(slug: str, result_dir: str,
         Ссылка на папку в Google Drive или None
     """
     try:
-        # Проверяем наличие файла учетных данных
         if not os.path.exists(credentials_file):
             logger.error(f"Файл учетных данных не найден: {credentials_file}")
             return None
-        
-        # Создаем загрузчик
-        uploader = GoogleDriveUploader(credentials_file, folder_id)
-        
+
+        uploader = GoogleDriveUploader(
+            credentials_file=credentials_file,
+            folder_id=folder_id,
+            token_file=token_file,
+            root_folder_name=root_folder_name,
+        )
+
         if not uploader.service:
             logger.error("Не удалось инициализировать Google Drive сервис")
             return None
-        
-        # Загружаем результаты
+
         logger.info(f"Загрузка результатов воронки {slug} в Google Drive...")
         drive_url = uploader.upload_funnel_results(slug, result_dir)
-        
+
         if drive_url:
             logger.info(f"Результаты загружены в Google Drive: {drive_url}")
         else:
             logger.warning("Не удалось загрузить результаты в Google Drive")
-        
+
         return drive_url
-        
+
     except Exception as e:
         logger.error(f"Ошибка загрузки в Google Drive: {e}")
         return None
+
+
+async def upload_to_google_drive(
+    slug: str,
+    result_dir: str,
+    credentials_file: str,
+    folder_id: str,
+    token_file: str = "token.json",
+    root_folder_name: str = "",
+) -> Optional[str]:
+    loop = asyncio.get_running_loop()
+    executor = drive_upload_executor or thread_pool
+    return await loop.run_in_executor(
+        executor,
+        upload_to_google_drive_sync,
+        slug,
+        result_dir,
+        credentials_file,
+        folder_id,
+        token_file,
+        root_folder_name,
+    )
 
 
 # ====================
@@ -863,6 +1371,7 @@ class TaskQueueProcessor:
         self._total_tasks_created = 0
         self._total_tasks_completed = 0
         self._lock = asyncio.Lock()
+        self._active_tasks: Set[asyncio.Task] = set()
 
     async def increment_tasks_created(self, count: int = 1) -> None:
         """Увеличивает счетчик созданных задач"""
@@ -927,6 +1436,39 @@ class TaskQueueProcessor:
             except asyncio.CancelledError:
                 pass
         logger.info("🛑 Процессор очереди остановлен")
+
+    def _track_active_task(self, task: asyncio.Task) -> None:
+        self._active_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            self._active_tasks.discard(done_task)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                done_task.result()
+
+        task.add_done_callback(_on_done)
+
+    async def request_stop_all_active_tasks(self) -> int:
+        if not task_manager:
+            return 0
+        all_tasks = await task_manager.get_all_tasks(limit=500)
+        active_tasks = [
+            task for task in all_tasks
+            if task.status in (TaskStatus.PENDING, TaskStatus.PROCESSING)
+        ]
+        stop_count = 0
+        for task in active_tasks:
+            if await task_manager.request_stop(task.id):
+                stop_count += 1
+            task_stop_registry.request_stop(task.id)
+        return stop_count
+
+    async def wait_for_active_tasks(self, timeout: float = 15.0) -> int:
+        pending = list(self._active_tasks)
+        if not pending:
+            return 0
+        done, still_pending = await asyncio.wait(pending, timeout=timeout)
+        del done
+        return len(still_pending)
     
     async def _process_queue_loop(self):
         """Основной цикл обработки очереди"""
@@ -993,7 +1535,7 @@ class TaskQueueProcessor:
             # Проверяем, не начала ли задача уже выполняться
             current_task = await task_manager.get_task(task.id)
             if current_task and current_task.status == TaskStatus.PENDING:
-                asyncio.create_task(self._execute_task(task))
+                self._track_active_task(asyncio.create_task(self._execute_task(task)))
     
     async def _execute_task(self, task: FunnelTask) -> None:
         """Выполнение одной задачи"""
@@ -1001,6 +1543,8 @@ class TaskQueueProcessor:
         
         # Обновляем статус на processing
         await task_manager.update_status(task.id, TaskStatus.PROCESSING)
+        loop = asyncio.get_running_loop()
+        stop_event = task_stop_registry.register(task.id, task.user_id)
         
         # Уведомляем пользователя о старте (пакетно для multi-URL)
         cfg = get_config()
@@ -1011,6 +1555,27 @@ class TaskQueueProcessor:
             await notify_task_start(bot, task.user_id, task)
         
         try:
+            def progress_callback(current_task_id: int, current_step: int, total_steps: int,
+                                  message: str = "", last_url: Optional[str] = None) -> None:
+                future = asyncio.run_coroutine_threadsafe(
+                    task_manager.update_progress(
+                        current_task_id,
+                        current_step,
+                        total_steps,
+                        message,
+                        last_url,
+                    ),
+                    loop,
+                )
+
+                def _consume_result(done_future):
+                    try:
+                        done_future.result()
+                    except Exception as callback_error:
+                        logger.error(f"Ошибка обновления прогресса task_id={current_task_id}: {callback_error}")
+
+                future.add_done_callback(_consume_result)
+
             # Запускаем воронку в thread pool
             result = await asyncio.get_event_loop().run_in_executor(
                 thread_pool,
@@ -1019,53 +1584,55 @@ class TaskQueueProcessor:
                 cfg.runner.__dict__,
                 task.id,
                 task.user_id,
-                None,
+                progress_callback,
+                stop_event,
             )
             
-            # Загружаем в Google Drive если включено
-            drive_url = None
-            if cfg.google_drive.enabled and not result.get("error"):
-                try:
-                    drive_url = await upload_to_google_drive(
-                        slug=result.get("slug", ""),
-                        result_dir=result.get("path", ""),
-                        credentials_file=cfg.google_drive.credentials_file,
-                        folder_id=cfg.google_drive.folder_id,
-                    )
-                except Exception as e:
-                    logger.error(f"Ошибка загрузки в Google Drive: {e}")
+            # Папка создается заранее, а файлы загружаются сразу после сохранения.
+            drive_url = result.get("drive_folder_url")
             
             # Обновляем результаты
             await task_manager.complete_task(
                 task_id=task.id,
                 steps_total=result.get("steps_total", 0),
                 paywall_reached=result.get("paywall_reached", False),
-                error=result.get("error"),
+                error=None if result.get("stopped") else result.get("error"),
                 screenshot_path=result.get("last_screenshot"),
                 log_path=result.get("log_path"),
                 manifest_path=result.get("manifest_path"),
                 drive_folder_url=drive_url,
+                last_url=result.get("last_url"),
+                final_status=TaskStatus.CANCELLED if result.get("stopped") else None,
+                progress_message=(
+                    result.get("progress_message")
+                    or (f"Остановлено пользователем на шаге {result.get('steps_total', 0)}" if result.get("stopped") else "")
+                ),
             )
             
             # Получаем обновленную задачу
             completed_task = await task_manager.get_task(task.id)
-            
+             
             # Уведомляем о завершении
-            if result.get("error"):
+            if result.get("stopped"):
+                await notify_task_cancelled(bot, task.user_id, completed_task)
+            elif result.get("error"):
                 await notify_task_error(bot, task.user_id, completed_task, result["error"])
             else:
                 await notify_task_complete(bot, task.user_id, completed_task)
-            
+
             # Уведомляем процессор очереди о завершении задачи
             await queue_processor.increment_tasks_completed()
 
         except Exception as e:
             logger.error(f"Ошибка обработки задачи #{task.id}: {e}")
             await task_manager.update_status(task.id, TaskStatus.FAILED)
-            await task_manager.complete_task(task.id, 0, False, error=str(e))
-            await notify_task_error(bot, task.user_id, task, str(e))
+            await task_manager.complete_task(task.id, 0, False, error=str(e), last_url=task.url)
+            failed_task = await task_manager.get_task(task.id)
+            await notify_task_error(bot, task.user_id, failed_task or task, str(e))
             # Уведомляем процессор очереди о завершении задачи
             await queue_processor.increment_tasks_completed()
+        finally:
+            task_stop_registry.unregister(task.id, task.user_id)
 
 
 # Глобальный процессор очереди
@@ -1073,208 +1640,52 @@ queue_processor = TaskQueueProcessor()
 
 
 def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: int,
-                            progress_callback=None) -> dict:
+                            progress_callback=None, stop_event=None) -> dict:
     """
-    Обертка для run_funnel с поддержкой прогресса
-    progress_callback - синхронная функция для обновления прогресса
+    Обертка для общего runner.py с поддержкой Telegram-прогресса и Drive-интеграции.
     """
-    from main import save_error_artifacts as save_error_artifacts_main
-    
-    # Создаем временный конфиг для run_funnel
-    temp_config = {
-        "max_steps": config_dict.get("max_steps", 80),
-        "slow_mo_ms": config_dict.get("slow_mo_ms", 100),
-        "fill_values": config_dict.get("fill_values", {}),
-    }
-
+    config = load_runner_config('config.json')
     slug = get_slug(url)
-    res_dir = os.path.join('results', slug)
-    os.makedirs(res_dir, exist_ok=True)
+    upload_run_id = f"task-{task_id or slug}"
 
-    classified_dir = os.path.join('results', '_classified')
-    for cat in ['question', 'info', 'input', 'email', 'paywall', 'other', 'checkout']:
-        os.makedirs(os.path.join(classified_dir, cat), exist_ok=True)
-
-    result = {
-        "url": url,
-        "slug": slug,
-        "steps_total": 0,
-        "paywall_reached": False,
-        "last_url": "",
-        "path": res_dir,
-        "error": None,
-        "last_screenshot": None,
-        "log_path": None,
-        "manifest_path": None,
-    }
-
-    max_steps = temp_config.get("max_steps", 80)
-    slow_mo = temp_config.get("slow_mo_ms", 100)
-    fill_values = resolve_fill_values(temp_config)
-
-    log_path = os.path.join(res_dir, 'log.txt')
-    result["log_path"] = log_path
-    
-    # Список для хранения логов (нужен для сохранения при ошибке)
-    log_lines = []
-
-    with open(log_path, 'w', encoding='utf-8') as f:
-        def log(m):
-            l = f"[{time.strftime('%H:%M:%S')}] {m}\n"
-            f.write(l)
-            print(l.strip())
-            log_lines.append(l.strip())
-
+    drive_folder_url: Optional[str] = None
+    if drive_upload_manager is not None:
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, slow_mo=slow_mo)
-                page = browser.new_context(**p.devices['iPhone 13']).new_page()
-                
-                # Перехватываем console.error для сбора JS ошибок
-                def handle_console(msg):
-                    if msg.type == "error":
-                        try:
-                            page.evaluate("""(text) => {
-                                if (!window.__qwen_console_errors) {
-                                    window.__qwen_console_errors = [];
-                                }
-                                window.__qwen_console_errors.push(text);
-                                if (window.__qwen_console_errors.length > 100) {
-                                    window.__qwen_console_errors.shift();
-                                }
-                            }""", msg.text)
-                        except:
-                            pass
-                page.on("console", handle_console)
-                
-                log(f"Переход на {url} (slug: {slug})")
-
-                try:
-                    page.goto(url, wait_until='load', timeout=60000)
-                except TimeoutError:
-                    result["error"] = "navigation_timeout"
-                    log("Ошибка: таймаут открытия страницы")
-                    # Сохраняем артефакты при ошибке
-                    try:
-                        save_error_artifacts_main(page, url, result["error"], log_lines, log)
-                    except:
-                        pass
-                    browser.close()
-                    return result
-
-                step = 1
-                history_counts = defaultdict(int)
-                step_attempts = defaultdict(int)
-                last_error_artifacts_saved = False
-                url_history = [page.url]  # История URL для детекции циклов
-
-                while step <= max_steps:
-                    # Обновляем прогресс через callback
-                    if progress_callback:
-                        progress_callback(task_id, step, max_steps, f"Обработка шага {step}...")
-
-                    curr_u = page.url
-                    if any(k in curr_u for k in ["magic", "analyzing", "loading", "preparePlan"]):
-                        time.sleep(10)
-                        curr_u = page.url
-
-                    close_popups(page, log)
-                    time.sleep(1)
-                    curr_h = get_screen_hash(page)
-                    st = classify_screen(page, log)
-                    ui_before = get_ui_step(page)
-
-                    if st in ['paywall', 'checkout']:
-                        warmup_page_for_full_screenshot(page, log)
-                        curr_h = get_screen_hash(page)
-
-                    step_key = f"{urlparse(curr_u).path}|{ui_before}|{st}"
-                    repeat_attempt = step_attempts[step_key]
-                    step_attempts[step_key] += 1
-
-                    curr_id = f"{curr_u}|{curr_h}"
-                    history_counts[curr_id] += 1
-                    loop_limit = 8 if WORKOUT_ISSUES_STEP_KEY in curr_u.lower() else 3
-
-                    if history_counts[curr_id] >= loop_limit:
-                        log(f"Обнаружено зацикливание на {curr_u}. Остановка.")
-                        result["error"] = "stuck_loop"
-                        # Сохраняем артефакты при зацикливании
-                        try:
-                            save_error_artifacts_main(page, url, result["error"], log_lines, log)
-                            last_error_artifacts_saved = True
-                        except:
-                            pass
-                        break
-
-                    screen_name = f"{step:02d}_{st}.png"
-                    local_path = os.path.join(res_dir, screen_name)
-                    result["last_screenshot"] = local_path
-
-                    try:
-                        page.screenshot(path=local_path, full_page=True)
-                        shutil.copy2(local_path, os.path.join(classified_dir, st, f"{slug}__{screen_name}"))
-                    except Exception as e:
-                        log(f"Ошибка сохранения скриншота: {str(e)[:120]}")
-
-                    log(f"Шаг:{step} | тип:{st} | ui_step:{ui_before} | url:{page.url[:60]}")
-                    act = perform_action(page, st, log, res_dir, curr_h, curr_u, fill_values, repeat_attempt=repeat_attempt)
-
-                    time.sleep(1)
-                    ui_after = get_ui_step(page)
-
-                    log(f"Результат действия:{act}")
-
-                    # Добавляем URL в историю
-                    url_history.append(page.url)
-                    # Проверяем на циклы
-                    if detect_url_loop(page, url_history, log):
-                        log(f"Обнаружен циклический переход. Пробуем альтернативное действие.")
-                        # Увеличиваем счетчик попыток для текущего шага
-                        step_attempts[step_key] = min(step_attempts[step_key] + 2, 5)
-
-                    result["steps_total"] = step
-                    result["last_url"] = page.url
-
-                    if st in ['paywall', 'checkout'] or "stopped" in act or "reached" in act:
-                        if st in ['paywall', 'checkout'] or "paywall" in act:
-                            result["paywall_reached"] = True
-                        break
-
-                    step += 1
-                
-                # Если была ошибка и артефакты еще не сохранены - сохраняем
-                if result["error"] and not last_error_artifacts_saved:
-                    try:
-                        save_error_artifacts_main(page, url, result["error"], log_lines, log)
-                    except:
-                        pass
-
-                browser.close()
-
-                # Создаем manifest.json
-                manifest = {
-                    "url": url,
-                    "started_at": datetime.now().isoformat(),
-                    "completed_at": datetime.now().isoformat(),
-                    "status": "success" if result["paywall_reached"] else "completed",
-                    "steps_total": result["steps_total"],
-                    "paywall_reached": result["paywall_reached"],
-                    "error": result["error"],
-                }
-                manifest_path = os.path.join(res_dir, 'manifest.json')
-                with open(manifest_path, 'w', encoding='utf-8') as mf:
-                    json.dump(manifest, mf, indent=2, ensure_ascii=False)
-                result["manifest_path"] = manifest_path
-
+            drive_folder_url = drive_upload_manager.register_run(upload_run_id, slug, os.path.join('results', slug))
         except Exception as e:
-            result["error"] = f"runner_exception:{str(e)[:180]}"
-            log(f"Критическая ошибка раннера: {str(e)[:180]}")
-            # Сохраняем артефакты при критической ошибке
+            logger.error(f"Не удалось зарегистрировать Drive upload run {upload_run_id}: {e}")
+
+    def enqueue_drive_artifact(file_path: Optional[str], drive_subdir: str = "") -> None:
+        if not file_path or drive_upload_manager is None:
+            return
+        try:
+            drive_upload_manager.enqueue_file(upload_run_id, file_path, drive_subdir=drive_subdir)
+        except Exception as e:
+            logger.error(f"Не удалось поставить файл в Drive очередь: {file_path} | {e}")
+
+    def request_progress(current_step: int, total_steps: int, message: str = "", last_url: Optional[str] = None) -> None:
+        if progress_callback:
             try:
-                save_error_artifacts_main(page, url, result["error"], log_lines, log)
-            except:
+                progress_callback(task_id, current_step, total_steps, message, last_url)
+            except Exception:
                 pass
+
+    result = run_funnel(
+        url=url,
+        config=config,
+        is_headless=True,
+        progress_callback=request_progress,
+        stop_event=stop_event,
+        artifact_callback=enqueue_drive_artifact,
+        write_manifest=True,
+    )
+    result["drive_folder_url"] = drive_folder_url
+
+    if drive_upload_manager is not None:
+        try:
+            result["drive_folder_url"] = drive_upload_manager.finalize_run(upload_run_id) or result.get("drive_folder_url")
+        except Exception as finalize_error:
+            logger.error(f"Не удалось финализировать Drive run {upload_run_id}: {finalize_error}")
 
     return result
 
@@ -1285,7 +1696,7 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
 
 async def start_bot() -> None:
     """Запуск бота"""
-    global bot, dp, task_manager, thread_pool, error_collector
+    global bot, dp, task_manager, thread_pool, drive_upload_executor, error_collector, drive_upload_queue, drive_upload_manager
 
     # Инициализация конфигурации
     init_config()
@@ -1301,7 +1712,20 @@ async def start_bot() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     task_manager = TaskManager()
     thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS)
+    drive_upload_executor = ThreadPoolExecutor(max_workers=max(1, cfg.google_drive.max_parallel_uploads))
     error_collector = ErrorCollector()
+    drive_upload_queue = DriveUploadQueue()
+    drive_upload_manager = None
+    if cfg.google_drive.enabled:
+        drive_upload_manager = ParallelDriveUploadManager(
+            credentials_file=cfg.google_drive.credentials_file,
+            folder_id=cfg.google_drive.folder_id,
+            token_file=cfg.google_drive.token_file,
+            root_folder_name=cfg.google_drive.root_folder_name,
+            max_workers=max(1, cfg.google_drive.max_parallel_uploads),
+        )
+        drive_upload_manager.start()
+        drive_upload_manager.recover_pending_runs("results")
 
     # Регистрируем роутеры
     router = Router()
@@ -1313,6 +1737,7 @@ async def start_bot() -> None:
     router.message.register(cmd_cancel, Command("cancel"))
     router.message.register(cmd_clear, Command("clear"))
     router.message.register(cmd_drive, Command("drive"))
+    router.message.register(cmd_drive_stop, Command("drive_stop"))
     router.message.register(cmd_help, Command("help"))
 
     # Сообщения (URL)
@@ -1330,9 +1755,10 @@ async def start_bot() -> None:
         BotCommand(command="start", description="Запуск бота"),
         BotCommand(command="status", description="Статус последней задачи"),
         BotCommand(command="history", description="Последние задачи"),
-        BotCommand(command="cancel", description="Отменить активную задачу"),
+        BotCommand(command="cancel", description="Остановить все активные задачи"),
         BotCommand(command="clear", description="Сбросить зависшие задачи"),
         BotCommand(command="drive", description="Открыть результаты в Drive"),
+        BotCommand(command="drive_stop", description="Остановить загрузки в Drive"),
         BotCommand(command="help", description="Краткая помощь"),
     ])
 
@@ -1343,34 +1769,92 @@ async def start_bot() -> None:
 
     # Запускаем процессор очереди
     await queue_processor.start()
+    await drive_upload_queue.start(1)
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except asyncio.CancelledError:
+        logger.info("🤖 Polling остановлен")
+        raise
 
 
 async def stop_bot() -> None:
     """Остановка бота"""
-    global bot, thread_pool
+    global bot, dp, thread_pool, drive_upload_executor, drive_upload_queue, drive_upload_manager
 
-    # Останавливаем процессор очереди
-    await queue_processor.stop()
+    if dp:
+        with contextlib.suppress(Exception):
+            await dp.stop_polling()
+
+    stop_count = await queue_processor.request_stop_all_active_tasks()
+    if stop_count:
+        logger.info("⛔ Запрошена остановка активных задач: %s", stop_count)
+
+    with contextlib.suppress(Exception):
+        await queue_processor.stop()
+
+    remaining_active = 0
+    with contextlib.suppress(Exception):
+        remaining_active = await queue_processor.wait_for_active_tasks(timeout=15.0)
+    if remaining_active:
+        logger.warning("Некоторые runner-задачи не завершились до таймаута shutdown: %s", remaining_active)
+
+    if drive_upload_queue:
+        with contextlib.suppress(Exception):
+            await drive_upload_queue.force_stop()
+
+    if drive_upload_manager:
+        with contextlib.suppress(Exception):
+            drive_upload_manager.cancel_pending(reason="Bot shutdown")
+        with contextlib.suppress(Exception):
+            drive_upload_manager.stop(wait=False)
 
     if bot:
-        await bot.close()
+        with contextlib.suppress(Exception):
+            await bot.close()
         logger.info("🤖 Бот остановлен")
 
     if thread_pool:
-        thread_pool.shutdown(wait=True)
+        thread_pool.shutdown(wait=False, cancel_futures=True)
         logger.info("🔧 Thread pool остановлен")
+
+    if drive_upload_executor:
+        drive_upload_executor.shutdown(wait=False, cancel_futures=True)
+        logger.info("☁️ Google Drive thread pool остановлен")
+
+
+async def run_bot() -> None:
+    """Единый lifecycle бота с graceful shutdown."""
+    current_loop = asyncio.get_running_loop()
+
+    def _request_shutdown() -> None:
+        current_task = asyncio.current_task(loop=current_loop)
+        if current_task:
+            current_task.cancel()
+
+    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            current_loop.add_signal_handler(sig, _request_shutdown)
+
+    try:
+        await start_bot()
+    except asyncio.CancelledError:
+        logger.info("👋 Запущен graceful shutdown бота")
+    except KeyboardInterrupt:
+        logger.info("👋 Остановка по сигналу пользователя...")
+    finally:
+        await stop_bot()
 
 
 def main() -> None:
     """Точка входа"""
     try:
-        asyncio.run(start_bot())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
-        logger.info("👋 Остановка по сигналу пользователя...")
-    finally:
-        asyncio.run(stop_bot())
+        logger.info("👋 Остановка по сигналу пользователя завершена")
 
 
 if __name__ == "__main__":
