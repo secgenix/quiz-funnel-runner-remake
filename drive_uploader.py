@@ -706,6 +706,68 @@ class ParallelDriveUploadManager:
             self._started = False
         logger.info("Parallel Google Drive uploader stopped")
 
+    def cancel_pending(self, reason: str = "Stopped by user") -> Dict[str, int]:
+        drained_tasks: List[DriveUploadTask] = []
+        with self._lock:
+            self._stop_requested = True
+
+        while True:
+            try:
+                queued_item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if queued_item is None:
+                self._queue.task_done()
+                continue
+
+            drained_tasks.append(queued_item)
+            self._queue.task_done()
+
+        cancelled_runs = set()
+        queued_entries = 0
+        uploading_entries = 0
+        with self._lock:
+            for queued_item in drained_tasks:
+                run = self._runs.get(queued_item.run_id)
+                if not run:
+                    continue
+                entry = run["entries"].setdefault(queued_item.relative_path, {})
+                if entry.get("status") == "uploaded":
+                    continue
+                entry["status"] = "cancelled"
+                entry["last_error"] = reason[:500]
+                entry["cancelled_at"] = time.time()
+                entry.pop("retry_after", None)
+                entry.pop("failed_at", None)
+                cancelled_runs.add(queued_item.run_id)
+
+            for run_id, run in self._runs.items():
+                entries = run.get("entries") or {}
+                for entry in entries.values():
+                    status = str(entry.get("status") or "")
+                    if status == "queued":
+                        entry["status"] = "cancelled"
+                        entry["last_error"] = reason[:500]
+                        entry["cancelled_at"] = time.time()
+                        entry.pop("retry_after", None)
+                        entry.pop("failed_at", None)
+                        queued_entries += 1
+                        cancelled_runs.add(run_id)
+                    elif status == "uploading":
+                        uploading_entries += 1
+
+            for run_id in cancelled_runs:
+                self._write_state_locked(run_id)
+                self._update_completion_state_locked(run_id)
+
+        return {
+            "cleared_tasks": len(drained_tasks),
+            "queued_entries_cancelled": queued_entries,
+            "active_uploads": uploading_entries,
+            "runs_affected": len(cancelled_runs),
+        }
+
     def register_run(self, run_id: str, slug: str, result_dir: str) -> Optional[str]:
         run_path = Path(result_dir)
         run_path.mkdir(parents=True, exist_ok=True)
@@ -760,6 +822,9 @@ class ParallelDriveUploadManager:
             return False
 
         with self._lock:
+            if self._stop_requested:
+                logger.info("Drive upload skipped because uploader is stopping: %s", file_path)
+                return False
             run = self._runs.get(run_id)
             if not run:
                 logger.warning("Drive upload skipped, run is not registered: %s", run_id)

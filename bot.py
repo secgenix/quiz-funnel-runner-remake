@@ -3,9 +3,11 @@ Telegram бот для Quiz Funnel Runner
 Интеграция с aiogram 3.x
 """
 import asyncio
+import contextlib
 import logging
 import os
 import re
+import signal
 import shutil
 import threading
 import time
@@ -36,41 +38,11 @@ from models import TaskManager, FunnelTask, TaskStatus
 from drive_uploader import GoogleDriveUploader, ParallelDriveUploadManager
 from google_links_reader import GoogleLinksReader, is_google_url
 
-# Импортируем функции из main.py
-from main import (
-    run_funnel,
-    get_slug,
-    classify_screen,
-    perform_action,
-    close_popups,
-    get_screen_hash,
-    get_ui_step,
-    wait_for_transition,
-    find_continue_button,
-    warmup_page_for_full_screenshot,
-    ensure_privacy_checkbox_checked,
-    ensure_consent_checkbox_checked,
-    is_probable_paywall_url,
-    resolve_fill_values,
-    FILLABLE_INPUT_SELECTOR,
-    DEBUG_CLASSIFY,
-    WORKOUT_ISSUES_STEP_KEY,
-    WORKOUT_FREQUENCY_STEP_KEY,
-    DATE_OF_BIRTH_STEP_KEY,
-    save_error_artifacts,
-    check_and_handle_form_blockers,
-    detect_page_stuck_state,
-    detect_url_loop,
-    has_meaningful_progress,
-)
-from ai_fallback import run_ai_fallback, resolve_ai_fallback_settings
+from runner import get_slug, load_runner_config, run_funnel
 
-from playwright.sync_api import sync_playwright, Page, TimeoutError
-from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import json
-import hashlib
-import argparse
 
 # Настройка логирования
 logging.basicConfig(
@@ -249,6 +221,35 @@ class DriveUploadQueue:
         self._workers.clear()
         logger.info("☁️ Фоновая очередь Google Drive остановлена")
 
+    async def force_stop(self) -> Dict[str, int]:
+        """Немедленно прекращает приём новых задач и очищает все ещё не начавшиеся jobs."""
+        self._running = False
+        cleared_jobs = 0
+        while True:
+            try:
+                queued_job = self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            if queued_job is not None:
+                cleared_jobs += 1
+            self.queue.task_done()
+
+        workers = list(self._workers)
+        for _ in workers:
+            await self.queue.put(None)
+        for worker in workers:
+            try:
+                await asyncio.wait_for(worker, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                worker.cancel()
+        self._workers.clear()
+        logger.info("☁️ Фоновая очередь Google Drive принудительно остановлена, cleared_jobs=%s", cleared_jobs)
+        return {
+            "cleared_jobs": cleared_jobs,
+            "active_jobs": len(self._inflight),
+        }
+
     async def enqueue(self, job: DriveUploadJob) -> bool:
         async with self._lock:
             if job.task_id in self._inflight:
@@ -379,6 +380,7 @@ MENU_BUTTONS_MAP = {
     "⛔ Стоп все": "/cancel",
     "🧹 Очистить": "/clear",
     "📁 Drive": "/drive",
+    "🛑 Drive стоп": "/drive_stop",
     "ℹ️ Помощь": "/help",
 }
 
@@ -389,11 +391,46 @@ def build_main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📊 Статус"), KeyboardButton(text="📜 История")],
             [KeyboardButton(text="⛔ Стоп все"), KeyboardButton(text="🧹 Очистить")],
-            [KeyboardButton(text="📁 Drive"), KeyboardButton(text="ℹ️ Помощь")],
+            [KeyboardButton(text="📁 Drive"), KeyboardButton(text="🛑 Drive стоп")],
+            [KeyboardButton(text="ℹ️ Помощь")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Вставьте URL или выберите действие из меню",
     )
+
+
+def build_drive_controls():
+    """Inline-кнопка принудительной остановки Drive upload."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🛑 Остановить Drive upload", callback_data="stop_drive_uploads")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def stop_drive_uploads(force_reason: str) -> Dict[str, int]:
+    """Принудительно останавливает дальнейшие загрузки в Google Drive и очищает очередь."""
+    result = {
+        "drive_queue_cleared": 0,
+        "drive_queue_active": 0,
+        "manager_cleared": 0,
+        "manager_entries_cancelled": 0,
+        "manager_active": 0,
+        "runs_affected": 0,
+    }
+
+    if drive_upload_queue:
+        stats = await drive_upload_queue.force_stop()
+        result["drive_queue_cleared"] = int(stats.get("cleared_jobs", 0))
+        result["drive_queue_active"] = int(stats.get("active_jobs", 0))
+
+    if drive_upload_manager:
+        stats = drive_upload_manager.cancel_pending(reason=force_reason)
+        result["manager_cleared"] = int(stats.get("cleared_tasks", 0))
+        result["manager_entries_cancelled"] = int(stats.get("queued_entries_cancelled", 0))
+        result["manager_active"] = int(stats.get("active_uploads", 0))
+        result["runs_affected"] = int(stats.get("runs_affected", 0))
+
+    return result
 
 
 def build_active_task_controls(tasks: List[FunnelTask]):
@@ -982,7 +1019,7 @@ async def cmd_drive(message: Message) -> None:
                 f"🧭 Шагов: {task.steps_total} • Paywall: {'✅' if task.paywall_reached else '❌'}\n\n"
                 f"🔗 <a href='{task.drive_folder_url}'>Открыть папку в Google Drive</a>",
                 parse_mode="HTML",
-                reply_markup=build_main_menu(),
+                reply_markup=build_drive_controls(),
             )
             return
 
@@ -997,10 +1034,40 @@ async def cmd_help(message: Message) -> None:
     """Обработка команды /help"""
     await message.answer(
         "ℹ️ <b>Команды:</b>\n"
-        "/status • /history • /cancel • /clear • /drive • /help\n\n"
+        "/status • /history • /cancel • /clear • /drive • /drive_stop • /help\n\n"
         "⛔ /cancel — мягко остановить все активные задачи с сохранением промежуточного результата.\n"
-        "📜 В истории доступны кнопки точечной остановки отдельных задач.\n\n"
+        "🛑 /drive_stop — принудительно остановить загрузку файлов в Google Drive и очистить незагруженную очередь.\n"
+        " В истории доступны кнопки точечной остановки отдельных задач.\n\n"
         "📝 Отправьте URL (или список URL) для запуска задач.",
+        parse_mode="HTML",
+        reply_markup=build_main_menu(),
+    )
+
+
+async def cmd_drive_stop(message: Message) -> None:
+    """Принудительная остановка загрузок в Google Drive и очистка очереди."""
+    user_id = message.from_user.id
+
+    if not check_user_access(user_id):
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
+        return
+
+    if not drive_upload_manager and not drive_upload_queue:
+        await message.answer(
+            "ℹ️ Google Drive загрузчик не запущен.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    stats = await stop_drive_uploads("Drive uploads stopped by user")
+    active_hint = max(int(stats.get("drive_queue_active", 0)), int(stats.get("manager_active", 0)))
+    await message.answer(
+        "🛑 <b>Google Drive upload остановлен</b>\n"
+        f"🧹 Удалено из внутренних очередей: <b>{int(stats.get('drive_queue_cleared', 0)) + int(stats.get('manager_cleared', 0))}</b>\n"
+        f"📄 Отменено незагруженных записей: <b>{int(stats.get('manager_entries_cancelled', 0))}</b>\n"
+        f"📁 Затронуто сессий: <b>{int(stats.get('runs_affected', 0))}</b>\n"
+        + (f"⏳ Уже начатых загрузок сейчас выполняется: <b>{active_hint}</b>\n" if active_hint else "")
+        + "Новые файлы в Drive в этой сессии больше не будут ставиться в очередь.",
         parse_mode="HTML",
         reply_markup=build_main_menu(),
     )
@@ -1024,6 +1091,8 @@ async def handle_menu_buttons(message: Message, state: FSMContext) -> None:
         await cmd_clear(message)
     elif command == "/drive":
         await cmd_drive(message)
+    elif command == "/drive_stop":
+        await cmd_drive_stop(message)
     elif command == "/help":
         await cmd_help(message)
 
@@ -1197,6 +1266,20 @@ async def handle_callback_query(callback: CallbackQuery) -> None:
         else:
             await callback.answer("ℹ️ Задача уже завершена", show_alert=True)
 
+    if data == "stop_drive_uploads":
+        user_id = callback.from_user.id
+
+        if not check_user_access(user_id):
+            await callback.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        stats = await stop_drive_uploads("Drive uploads stopped from Telegram callback")
+        await callback.answer(
+            f"🛑 Drive queue cleared: {int(stats.get('drive_queue_cleared', 0)) + int(stats.get('manager_cleared', 0))}",
+            show_alert=True,
+        )
+        return
+
 
 # ====================
 # Google Drive загрузка
@@ -1288,6 +1371,7 @@ class TaskQueueProcessor:
         self._total_tasks_created = 0
         self._total_tasks_completed = 0
         self._lock = asyncio.Lock()
+        self._active_tasks: Set[asyncio.Task] = set()
 
     async def increment_tasks_created(self, count: int = 1) -> None:
         """Увеличивает счетчик созданных задач"""
@@ -1352,6 +1436,39 @@ class TaskQueueProcessor:
             except asyncio.CancelledError:
                 pass
         logger.info("🛑 Процессор очереди остановлен")
+
+    def _track_active_task(self, task: asyncio.Task) -> None:
+        self._active_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task) -> None:
+            self._active_tasks.discard(done_task)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                done_task.result()
+
+        task.add_done_callback(_on_done)
+
+    async def request_stop_all_active_tasks(self) -> int:
+        if not task_manager:
+            return 0
+        all_tasks = await task_manager.get_all_tasks(limit=500)
+        active_tasks = [
+            task for task in all_tasks
+            if task.status in (TaskStatus.PENDING, TaskStatus.PROCESSING)
+        ]
+        stop_count = 0
+        for task in active_tasks:
+            if await task_manager.request_stop(task.id):
+                stop_count += 1
+            task_stop_registry.request_stop(task.id)
+        return stop_count
+
+    async def wait_for_active_tasks(self, timeout: float = 15.0) -> int:
+        pending = list(self._active_tasks)
+        if not pending:
+            return 0
+        done, still_pending = await asyncio.wait(pending, timeout=timeout)
+        del done
+        return len(still_pending)
     
     async def _process_queue_loop(self):
         """Основной цикл обработки очереди"""
@@ -1418,7 +1535,7 @@ class TaskQueueProcessor:
             # Проверяем, не начала ли задача уже выполняться
             current_task = await task_manager.get_task(task.id)
             if current_task and current_task.status == TaskStatus.PENDING:
-                asyncio.create_task(self._execute_task(task))
+                self._track_active_task(asyncio.create_task(self._execute_task(task)))
     
     async def _execute_task(self, task: FunnelTask) -> None:
         """Выполнение одной задачи"""
@@ -1525,50 +1642,16 @@ queue_processor = TaskQueueProcessor()
 def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: int,
                             progress_callback=None, stop_event=None) -> dict:
     """
-    Обертка для run_funnel с поддержкой прогресса
-    progress_callback - синхронная функция для обновления прогресса
+    Обертка для общего runner.py с поддержкой Telegram-прогресса и Drive-интеграции.
     """
-    from main import save_error_artifacts as save_error_artifacts_main
-    
-    raw_ai_fallback = config_dict.get("ai_fallback", {}) if isinstance(config_dict, dict) else {}
-    if not isinstance(raw_ai_fallback, dict) or not raw_ai_fallback:
-        try:
-            with open('config.json', 'r', encoding='utf-8') as cf:
-                raw_config = json.load(cf)
-            raw_ai_fallback = raw_config.get("ai_fallback", {}) if isinstance(raw_config.get("ai_fallback"), dict) else {}
-        except Exception:
-            raw_ai_fallback = {}
-
-    runner_section = config_dict.get("runner", {}) if isinstance(config_dict.get("runner"), dict) else {
-        "max_steps": config_dict.get("max_steps", 80),
-        "slow_mo_ms": config_dict.get("slow_mo_ms", 100),
-        "fill_values": config_dict.get("fill_values", {}),
-    }
-
-    # Создаем временный конфиг для Telegram-раннера.
-    # Важно хранить и плоские ключи, и секции runner/ai_fallback, потому что
-    # часть функций читает старый формат, а AI fallback опирается на полную секцию.
-    temp_config = {
-        "max_steps": runner_section.get("max_steps", config_dict.get("max_steps", 80)),
-        "slow_mo_ms": runner_section.get("slow_mo_ms", config_dict.get("slow_mo_ms", 100)),
-        "fill_values": runner_section.get("fill_values", config_dict.get("fill_values", {})),
-        "runner": runner_section,
-        "ai_fallback": raw_ai_fallback,
-    }
-
+    config = load_runner_config('config.json')
     slug = get_slug(url)
-    res_dir = os.path.join('results', slug)
-    os.makedirs(res_dir, exist_ok=True)
     upload_run_id = f"task-{task_id or slug}"
-
-    classified_dir = os.path.join('results', '_classified')
-    for cat in ['question', 'info', 'input', 'email', 'paywall', 'other', 'checkout']:
-        os.makedirs(os.path.join(classified_dir, cat), exist_ok=True)
 
     drive_folder_url: Optional[str] = None
     if drive_upload_manager is not None:
         try:
-            drive_folder_url = drive_upload_manager.register_run(upload_run_id, slug, res_dir)
+            drive_folder_url = drive_upload_manager.register_run(upload_run_id, slug, os.path.join('results', slug))
         except Exception as e:
             logger.error(f"Не удалось зарегистрировать Drive upload run {upload_run_id}: {e}")
 
@@ -1580,333 +1663,29 @@ def run_funnel_sync_wrapper(url: str, config_dict: dict, task_id: int, user_id: 
         except Exception as e:
             logger.error(f"Не удалось поставить файл в Drive очередь: {file_path} | {e}")
 
-    result = {
-        "url": url,
-        "slug": slug,
-        "steps_total": 0,
-        "paywall_reached": False,
-        "start_url": url,
-        "last_url": "",
-        "path": res_dir,
-        "error": None,
-        "last_screenshot": None,
-        "log_path": None,
-        "manifest_path": None,
-        "stopped": False,
-        "progress_message": "",
-        "drive_folder_url": drive_folder_url,
-    }
-
-    max_steps = temp_config.get("max_steps", 80)
-    slow_mo = temp_config.get("slow_mo_ms", 100)
-    fill_values = resolve_fill_values(temp_config)
-    ai_settings = resolve_ai_fallback_settings(temp_config)
-
-    log_path = os.path.join(res_dir, 'log.txt')
-    result["log_path"] = log_path
-    
-    # Список для хранения логов (нужен для сохранения при ошибке)
-    log_lines = []
-
-    with open(log_path, 'w', encoding='utf-8') as f:
-        def log(m):
-            l = f"[{time.strftime('%H:%M:%S')}] {m}\n"
-            f.write(l)
-            f.flush()
-            print(l.strip())
-            log_lines.append(l.strip())
-
-        def request_progress(current_step: int, total_steps: int, message: str = "", last_url: Optional[str] = None) -> None:
-            result["progress_message"] = message
-            if progress_callback:
-                try:
-                    progress_callback(task_id, current_step, total_steps, message, last_url)
-                except Exception:
-                    pass
-
-        def save_last_state(page=None) -> None:
+    def request_progress(current_step: int, total_steps: int, message: str = "", last_url: Optional[str] = None) -> None:
+        if progress_callback:
             try:
-                if page:
-                    result["last_url"] = page.url or result.get("last_url") or url
-                    screen_name = f"{max(int(result.get('steps_total', 0)), 0):02d}_stopped.png"
-                    local_path = os.path.join(res_dir, screen_name)
-                    page.screenshot(path=local_path, full_page=True)
-                    result["last_screenshot"] = local_path
-                    enqueue_drive_artifact(local_path)
-            except Exception as screenshot_error:
-                log(f"Ошибка сохранения финального состояния при остановке: {str(screenshot_error)[:120]}")
-
-        def stop_requested() -> bool:
-            return bool(stop_event and stop_event.is_set())
-
-        def apply_stop(page=None, message: str = "Остановлено пользователем") -> bool:
-            if not stop_requested():
-                return False
-            result["stopped"] = True
-            result["error"] = None
-            result["paywall_reached"] = False
-            result["progress_message"] = message
-            log(message)
-            save_last_state(page)
-            request_progress(result.get("steps_total", 0), max_steps, message, result.get("last_url"))
-            return True
-
-        def interruptible_sleep(seconds: float, page=None) -> bool:
-            remaining = float(seconds)
-            while remaining > 0:
-                if apply_stop(page, "Остановка запрошена во время ожидания"):
-                    return True
-                chunk = min(0.25, remaining)
-                time.sleep(chunk)
-                remaining -= chunk
-            return False
-
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, slow_mo=slow_mo)
-                page = browser.new_context(**p.devices['iPhone 13']).new_page()
-                
-                # Перехватываем console.error для сбора JS ошибок
-                def handle_console(msg):
-                    if msg.type == "error":
-                        try:
-                            page.evaluate("""(text) => {
-                                if (!window.__qwen_console_errors) {
-                                    window.__qwen_console_errors = [];
-                                }
-                                window.__qwen_console_errors.push(text);
-                                if (window.__qwen_console_errors.length > 100) {
-                                    window.__qwen_console_errors.shift();
-                                }
-                            }""", msg.text)
-                        except:
-                            pass
-                page.on("console", handle_console)
-                if apply_stop(page, "Остановлено пользователем до открытия страницы"):
-                    browser.close()
-                    return result
-                
-                log(f"Переход на {url} (slug: {slug})")
-
-                try:
-                    page.goto(url, wait_until='load', timeout=60000)
-                    result["last_url"] = page.url or url
-                except TimeoutError:
-                    result["error"] = "navigation_timeout"
-                    result["last_url"] = page.url or url
-                    log("Ошибка: таймаут открытия страницы")
-                    # Сохраняем артефакты при ошибке
-                    try:
-                        save_error_artifacts_main(page, url, result["error"], log_lines, log)
-                    except:
-                        pass
-                    browser.close()
-                    return result
-
-                step = 1
-                history_counts = defaultdict(int)
-                step_attempts = defaultdict(int)
-                ai_attempts = defaultdict(int)
-                last_error_artifacts_saved = False
-                url_history = [page.url]  # История URL для детекции циклов
-
-                while step <= max_steps:
-                    if apply_stop(page, f"Остановлено пользователем на шаге {step}"):
-                        break
-
-                    # Обновляем прогресс через callback
-                    request_progress(step, max_steps, f"Обработка шага {step}...", page.url)
-
-                    curr_u = page.url
-                    if any(k in curr_u for k in ["magic", "analyzing", "loading", "preparePlan"]):
-                        if interruptible_sleep(10, page):
-                            break
-                        curr_u = page.url
-
-                    close_popups(page, log)
-                    if interruptible_sleep(1, page):
-                        break
-                    curr_h = get_screen_hash(page)
-                    st = classify_screen(page, log)
-                    ui_before = get_ui_step(page)
-
-                    if st in ['paywall', 'checkout']:
-                        warmup_page_for_full_screenshot(page, log)
-                        curr_h = get_screen_hash(page)
-
-                    step_key = f"{urlparse(curr_u).path}|{ui_before}|{st}"
-                    repeat_attempt = step_attempts[step_key]
-                    step_attempts[step_key] += 1
-
-                    curr_id = f"{curr_u}|{curr_h}"
-                    history_counts[curr_id] += 1
-                    loop_limit = 8 if WORKOUT_ISSUES_STEP_KEY in curr_u.lower() else 3
-
-                    if history_counts[curr_id] >= loop_limit:
-                        ai_budget = int(ai_settings.get("max_attempts_per_screen", 2))
-                        if ai_settings.get("enabled") and ai_attempts[curr_id] < ai_budget:
-                            ai_attempts[curr_id] += 1
-                            log(f"Обнаружено зацикливание на {curr_u}. Пробую AI fallback (attempt {ai_attempts[curr_id]}/{ai_budget})")
-                            fallback_result = run_ai_fallback(
-                                page=page,
-                                config=temp_config,
-                                results_dir=res_dir,
-                                fill_values=fill_values,
-                                screen_type=st,
-                                stuck_reason="stuck_loop",
-                                repeat_attempt=repeat_attempt,
-                                ui_step=ui_before,
-                                screen_hash=curr_h,
-                                log_lines=log_lines,
-                                log_func=log,
-                            )
-                            log(f"AI fallback result: {fallback_result.get('status')} | reason={fallback_result.get('reason')}")
-                            if interruptible_sleep(1.5, page):
-                                break
-                            after_ai_hash = get_screen_hash(page)
-                            after_ai_ui = get_ui_step(page)
-                            if has_meaningful_progress(curr_u, page.url, curr_h, after_ai_hash, ui_before, after_ai_ui):
-                                history_counts[curr_id] = 0
-                                continue
-                        log(f"Обнаружено зацикливание на {curr_u}. Остановка.")
-                        result["error"] = "stuck_loop"
-                        result["last_url"] = page.url or curr_u or url
-                        # Сохраняем артефакты при зацикливании
-                        try:
-                            save_error_artifacts_main(page, url, result["error"], log_lines, log)
-                            last_error_artifacts_saved = True
-                        except:
-                            pass
-                        break
-
-                    screen_name = f"{step:02d}_{st}.png"
-                    local_path = os.path.join(res_dir, screen_name)
-                    result["last_screenshot"] = local_path
-
-                    try:
-                        page.screenshot(path=local_path, full_page=True)
-                        classified_path = os.path.join(classified_dir, st, f"{slug}__{screen_name}")
-                        shutil.copy2(local_path, classified_path)
-                        enqueue_drive_artifact(local_path)
-                        enqueue_drive_artifact(classified_path, drive_subdir=f"_classified/{st}")
-                    except Exception as e:
-                        log(f"Ошибка сохранения скриншота: {str(e)[:120]}")
-
-                    log(f"Шаг:{step} | тип:{st} | ui_step:{ui_before} | url:{page.url[:60]}")
-                    act = perform_action(page, st, log, res_dir, curr_h, curr_u, fill_values, repeat_attempt=repeat_attempt)
-
-                    if apply_stop(page, f"Остановлено пользователем после действия на шаге {step}"):
-                        break
-
-                    if interruptible_sleep(1, page):
-                        break
-                    ui_after = get_ui_step(page)
-
-                    log(f"Результат действия:{act}")
-
-                    curr_hash_after_action = get_screen_hash(page)
-                    if ai_settings.get("enabled"):
-                        stuck_state = detect_page_stuck_state(page, log)
-                        no_progress = not has_meaningful_progress(curr_u, page.url, curr_h, curr_hash_after_action, ui_before, ui_after)
-                        ai_reason = None
-                        if stuck_state.get("is_stuck"):
-                            ai_reason = str(stuck_state.get("reason") or "stuck_state")
-                        elif no_progress and not any(k in act for k in ["paywall", "checkout", "reached", "stopped"]):
-                            ai_reason = "no_progress_after_action"
-
-                        ai_curr_id = f"{curr_u}|{curr_h}|{ui_before}|{st}"
-                        ai_budget = int(ai_settings.get("max_attempts_per_screen", 2))
-                        if ai_reason and ai_attempts[ai_curr_id] < ai_budget:
-                            ai_attempts[ai_curr_id] += 1
-                            log(f"AI fallback trigger: reason={ai_reason} | attempt {ai_attempts[ai_curr_id]}/{ai_budget}")
-                            fallback_result = run_ai_fallback(
-                                page=page,
-                                config=temp_config,
-                                results_dir=res_dir,
-                                fill_values=fill_values,
-                                screen_type=st,
-                                stuck_reason=ai_reason,
-                                repeat_attempt=repeat_attempt,
-                                ui_step=ui_before,
-                                screen_hash=curr_h,
-                                log_lines=log_lines,
-                                log_func=log,
-                            )
-                            log(f"AI fallback result: {fallback_result.get('status')} | reason={fallback_result.get('reason')}")
-                            if interruptible_sleep(1.5, page):
-                                break
-
-                    # Добавляем URL в историю
-                    url_history.append(page.url)
-                    # Проверяем на циклы
-                    if detect_url_loop(page, url_history, log):
-                        log(f"Обнаружен циклический переход. Пробуем альтернативное действие.")
-                        # Увеличиваем счетчик попыток для текущего шага
-                        step_attempts[step_key] = min(step_attempts[step_key] + 2, 5)
-
-                    result["steps_total"] = step
-                    result["last_url"] = page.url
-
-                    if st in ['paywall', 'checkout'] or "stopped" in act or "reached" in act:
-                        if st in ['paywall', 'checkout'] or "paywall" in act:
-                            result["paywall_reached"] = True
-                        break
-
-                    step += 1
-                
-                # Если была ошибка и артефакты еще не сохранены - сохраняем
-                if result["error"] and not result["stopped"] and not last_error_artifacts_saved:
-                    try:
-                        result["last_url"] = page.url or result.get("last_url") or url
-                        save_error_artifacts_main(page, url, result["error"], log_lines, log)
-                    except:
-                        pass
-
-                result["last_url"] = page.url or result.get("last_url") or url
-                browser.close()
-
-                # Создаем manifest.json
-                manifest = {
-                    "url": url,
-                    "started_at": datetime.now().isoformat(),
-                    "completed_at": datetime.now().isoformat(),
-                    "status": "cancelled" if result["stopped"] else ("success" if result["paywall_reached"] else "completed"),
-                    "steps_total": result["steps_total"],
-                    "paywall_reached": result["paywall_reached"],
-                    "error": result["error"],
-                    "last_url": result.get("last_url"),
-                    "progress_message": result.get("progress_message"),
-                }
-                manifest_path = os.path.join(res_dir, 'manifest.json')
-                with open(manifest_path, 'w', encoding='utf-8') as mf:
-                    json.dump(manifest, mf, indent=2, ensure_ascii=False)
-                result["manifest_path"] = manifest_path
-                enqueue_drive_artifact(log_path)
-                enqueue_drive_artifact(manifest_path)
-
-                if drive_upload_manager is not None:
-                    try:
-                        result["drive_folder_url"] = drive_upload_manager.finalize_run(upload_run_id) or result.get("drive_folder_url")
-                    except Exception as finalize_error:
-                        log(f"Ошибка финализации Drive загрузок: {str(finalize_error)[:120]}")
-
-        except Exception as e:
-            result["error"] = f"runner_exception:{str(e)[:180]}"
-            log(f"Критическая ошибка раннера: {str(e)[:180]}")
-            # Сохраняем артефакты при критической ошибке
-            try:
-                result["last_url"] = locals().get("page").url if "page" in locals() and page else result.get("last_url") or url
-                save_error_artifacts_main(page, url, result["error"], log_lines, log)
-            except:
+                progress_callback(task_id, current_step, total_steps, message, last_url)
+            except Exception:
                 pass
-        finally:
-            enqueue_drive_artifact(result.get("log_path"))
-            enqueue_drive_artifact(result.get("manifest_path"))
-            if drive_upload_manager is not None:
-                try:
-                    result["drive_folder_url"] = drive_upload_manager.finalize_run(upload_run_id) or result.get("drive_folder_url")
-                except Exception as finalize_error:
-                    logger.error(f"Не удалось финализировать Drive run {upload_run_id}: {finalize_error}")
+
+    result = run_funnel(
+        url=url,
+        config=config,
+        is_headless=True,
+        progress_callback=request_progress,
+        stop_event=stop_event,
+        artifact_callback=enqueue_drive_artifact,
+        write_manifest=True,
+    )
+    result["drive_folder_url"] = drive_folder_url
+
+    if drive_upload_manager is not None:
+        try:
+            result["drive_folder_url"] = drive_upload_manager.finalize_run(upload_run_id) or result.get("drive_folder_url")
+        except Exception as finalize_error:
+            logger.error(f"Не удалось финализировать Drive run {upload_run_id}: {finalize_error}")
 
     return result
 
@@ -1958,6 +1737,7 @@ async def start_bot() -> None:
     router.message.register(cmd_cancel, Command("cancel"))
     router.message.register(cmd_clear, Command("clear"))
     router.message.register(cmd_drive, Command("drive"))
+    router.message.register(cmd_drive_stop, Command("drive_stop"))
     router.message.register(cmd_help, Command("help"))
 
     # Сообщения (URL)
@@ -1978,6 +1758,7 @@ async def start_bot() -> None:
         BotCommand(command="cancel", description="Остановить все активные задачи"),
         BotCommand(command="clear", description="Сбросить зависшие задачи"),
         BotCommand(command="drive", description="Открыть результаты в Drive"),
+        BotCommand(command="drive_stop", description="Остановить загрузки в Drive"),
         BotCommand(command="help", description="Краткая помощь"),
     ])
 
@@ -1990,43 +1771,90 @@ async def start_bot() -> None:
     await queue_processor.start()
     await drive_upload_queue.start(1)
 
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except asyncio.CancelledError:
+        logger.info("🤖 Polling остановлен")
+        raise
 
 
 async def stop_bot() -> None:
     """Остановка бота"""
-    global bot, thread_pool, drive_upload_executor, drive_upload_queue, drive_upload_manager
+    global bot, dp, thread_pool, drive_upload_executor, drive_upload_queue, drive_upload_manager
 
-    # Останавливаем процессор очереди
-    await queue_processor.stop()
+    if dp:
+        with contextlib.suppress(Exception):
+            await dp.stop_polling()
+
+    stop_count = await queue_processor.request_stop_all_active_tasks()
+    if stop_count:
+        logger.info("⛔ Запрошена остановка активных задач: %s", stop_count)
+
+    with contextlib.suppress(Exception):
+        await queue_processor.stop()
+
+    remaining_active = 0
+    with contextlib.suppress(Exception):
+        remaining_active = await queue_processor.wait_for_active_tasks(timeout=15.0)
+    if remaining_active:
+        logger.warning("Некоторые runner-задачи не завершились до таймаута shutdown: %s", remaining_active)
 
     if drive_upload_queue:
-        await drive_upload_queue.stop()
+        with contextlib.suppress(Exception):
+            await drive_upload_queue.force_stop()
 
     if drive_upload_manager:
-        drive_upload_manager.stop(wait=True)
+        with contextlib.suppress(Exception):
+            drive_upload_manager.cancel_pending(reason="Bot shutdown")
+        with contextlib.suppress(Exception):
+            drive_upload_manager.stop(wait=False)
 
     if bot:
-        await bot.close()
+        with contextlib.suppress(Exception):
+            await bot.close()
         logger.info("🤖 Бот остановлен")
 
     if thread_pool:
-        thread_pool.shutdown(wait=True)
+        thread_pool.shutdown(wait=False, cancel_futures=True)
         logger.info("🔧 Thread pool остановлен")
 
     if drive_upload_executor:
-        drive_upload_executor.shutdown(wait=True)
+        drive_upload_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("☁️ Google Drive thread pool остановлен")
+
+
+async def run_bot() -> None:
+    """Единый lifecycle бота с graceful shutdown."""
+    current_loop = asyncio.get_running_loop()
+
+    def _request_shutdown() -> None:
+        current_task = asyncio.current_task(loop=current_loop)
+        if current_task:
+            current_task.cancel()
+
+    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            current_loop.add_signal_handler(sig, _request_shutdown)
+
+    try:
+        await start_bot()
+    except asyncio.CancelledError:
+        logger.info("👋 Запущен graceful shutdown бота")
+    except KeyboardInterrupt:
+        logger.info("👋 Остановка по сигналу пользователя...")
+    finally:
+        await stop_bot()
 
 
 def main() -> None:
     """Точка входа"""
     try:
-        asyncio.run(start_bot())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
-        logger.info("👋 Остановка по сигналу пользователя...")
-    finally:
-        asyncio.run(stop_bot())
+        logger.info("👋 Остановка по сигналу пользователя завершена")
 
 
 if __name__ == "__main__":

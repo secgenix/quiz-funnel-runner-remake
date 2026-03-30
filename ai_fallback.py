@@ -55,6 +55,19 @@ POST_INPUT_SUBMIT_KEYWORDS = [
     "continuar", "siguiente", "weiter", "suivant", "продолжить", "подтвердить"
 ]
 
+PROMPT_SYSTEM_TEXT = (
+    "Browser recovery assistant. Pick one safe action from candidates. "
+    "Reply with JSON only. Preferred keys: a,id,v,c,r. "
+    "a=click|input|wait|abort, id=element_id, v=input_text, c=0..1, r=short reason. "
+    "Optional: rf=[risk flags], alt=[backup ids]. "
+    "Do not invent selectors or coordinates. Avoid cookies, sharing, downloads, support, and unsafe checkout/payment actions."
+)
+
+MAX_PROMPT_CANDIDATES = 36
+MAX_PROMPT_PAGE_TEXT = 1800
+MAX_PROMPT_LOG_LINES = 8
+MAX_PROMPT_LOG_CHARS = 120
+
 
 @dataclass
 class AICandidate:
@@ -142,6 +155,70 @@ def resolve_ai_fallback_settings(config: dict) -> dict:
 
 def _normalize_text(*parts: str) -> str:
     return " ".join(p.strip() for p in parts if p and p.strip()).strip().lower()
+
+
+def _compact_text(value: str, limit: int) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 1)] + "…"
+
+
+def _compact_recent_logs(log_lines: List[str], limit: int) -> List[str]:
+    compacted: List[str] = []
+    seen = set()
+    slice_size = max(1, min(int(limit or MAX_PROMPT_LOG_LINES), MAX_PROMPT_LOG_LINES))
+    for raw_line in log_lines[-slice_size * 3 :]:
+        line = re.sub(r"^\[[^\]]+\]\s*", "", str(raw_line or "")).strip()
+        if not line:
+            continue
+        line = _compact_text(line, MAX_PROMPT_LOG_CHARS)
+        dedupe_key = line.lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        compacted.append(line)
+    return compacted[-slice_size:]
+
+
+def _serialize_candidate_for_prompt(candidate: AICandidate) -> Dict[str, Any]:
+    box = candidate.bounding_box or {}
+    payload: Dict[str, Any] = {
+        "id": candidate.element_id,
+        "k": candidate.kind,
+        "t": _compact_text(candidate.text, 90),
+        "a": _compact_text(candidate.aria_label, 60),
+        "p": _compact_text(candidate.placeholder, 60),
+        "n": _compact_text(candidate.name, 40),
+        "ty": _compact_text(candidate.input_type, 20),
+        "en": bool(candidate.enabled),
+        "ed": bool(candidate.editable),
+        "chk": bool(candidate.checked),
+        "bad": bool(candidate.forbidden),
+        "risk": bool(candidate.high_risk),
+        "vr": round(float(box.get("viewport_ratio", 0.0) or 0.0), 3),
+        "top": bool(box.get("unobstructed", False)),
+    }
+    if candidate.suggested_value:
+        payload["sv"] = _compact_text(candidate.suggested_value, 60)
+    if candidate.href:
+        payload["h"] = _compact_text(candidate.href, 80)
+    return payload
+
+
+def _build_prompt_payload(context: AIFallbackContext) -> Dict[str, Any]:
+    candidates = [_serialize_candidate_for_prompt(c) for c in context.candidates[:MAX_PROMPT_CANDIDATES]]
+    return {
+        "u": context.url,
+        "d": context.domain,
+        "st": context.screen_type,
+        "why": context.stuck_reason,
+        "try": context.repeat_attempt,
+        "step": context.ui_step,
+        "txt": _compact_text(context.page_text_excerpt, MAX_PROMPT_PAGE_TEXT),
+        "log": _compact_recent_logs(context.recent_logs, MAX_PROMPT_LOG_LINES),
+        "cand": candidates,
+    }
 
 
 def _compute_suggested_value(candidate: Dict[str, Any], fill_values: Dict[str, str]) -> Optional[str]:
@@ -362,26 +439,22 @@ def build_ai_fallback_context(
         screen_hash=screen_hash,
         screenshot_path=screenshot_path,
         screenshot_b64=screenshot_b64,
-        page_text_excerpt=page_text[: int(settings.get("page_text_limit", 5000))],
-        recent_logs=log_lines[-int(settings.get("recent_logs_limit", 25)) :],
+        page_text_excerpt=_compact_text(page_text, min(int(settings.get("page_text_limit", 5000)), MAX_PROMPT_PAGE_TEXT)),
+        recent_logs=_compact_recent_logs(log_lines, int(settings.get("recent_logs_limit", 25))),
         fill_values=fill_values,
         candidates=collect_actionable_elements(page, fill_values),
     )
 
 
 def _build_openai_input(context: AIFallbackContext) -> List[Dict[str, Any]]:
+    prompt_payload = _build_prompt_payload(context)
     return [
         {
             "role": "system",
             "content": [
                 {
                     "type": "input_text",
-                    "text": (
-                        "You are a browser recovery assistant. Select only one action from the provided candidates. "
-                        "Return strict JSON with fields: action, element_id, input_text, confidence, reason, risk_flags, alternative_element_ids. "
-                        "Allowed actions: click, input, wait, abort. Never output coordinates or custom selectors. "
-                        "Avoid cookie settings, share, destructive purchases, app downloads, or checkout submission."
-                    ),
+                    "text": PROMPT_SYSTEM_TEXT,
                 }
             ],
         },
@@ -390,21 +463,7 @@ def _build_openai_input(context: AIFallbackContext) -> List[Dict[str, Any]]:
             "content": [
                 {
                     "type": "input_text",
-                    "text": json.dumps(
-                        {
-                            "url": context.url,
-                            "domain": context.domain,
-                            "screen_type": context.screen_type,
-                            "stuck_reason": context.stuck_reason,
-                            "repeat_attempt": context.repeat_attempt,
-                            "ui_step": context.ui_step,
-                            "screen_hash": context.screen_hash,
-                            "recent_logs": context.recent_logs,
-                            "page_text_excerpt": context.page_text_excerpt,
-                            "candidates": [asdict(c) for c in context.candidates],
-                        },
-                        ensure_ascii=False,
-                    ),
+                    "text": json.dumps(prompt_payload, ensure_ascii=False, separators=(",", ":")),
                 },
                 {
                     "type": "input_image",
@@ -430,9 +489,10 @@ def request_ai_decision(context: AIFallbackContext, settings: dict, artifacts_di
     }
     _safe_json_dump(os.path.join(artifacts_dir, "ai_request.json"), request_dump)
     response = client.responses.create(
-        model=settings.get("model", "gpt-4.1-mini"),
+        model=settings.get("model", "gpt-5-nano"),
         input=payload,
         text={"format": {"type": "json_object"}},
+        max_output_tokens=180,
     )
     response_dump = response.model_dump() if hasattr(response, "model_dump") else {"output_text": getattr(response, "output_text", "")}
     _safe_json_dump(os.path.join(artifacts_dir, "ai_response.json"), response_dump)
@@ -444,25 +504,25 @@ def request_ai_decision(context: AIFallbackContext, settings: dict, artifacts_di
 
 def normalize_ai_decision(payload: Dict[str, Any]) -> AIDecision:
     try:
-        confidence = float(payload.get("confidence", 0.0))
+        confidence = float(payload.get("confidence", payload.get("c", 0.0)))
     except Exception:
         confidence = 0.0
     confidence = max(0.0, min(1.0, confidence))
-    action = str(payload.get("action", "abort")).strip().lower()
+    action = str(payload.get("action", payload.get("a", "abort"))).strip().lower()
     if action not in {"click", "input", "wait", "abort"}:
         action = "abort"
-    alt_ids = payload.get("alternative_element_ids") or []
+    alt_ids = payload.get("alternative_element_ids") or payload.get("alt") or []
     if not isinstance(alt_ids, list):
         alt_ids = []
-    risk_flags = payload.get("risk_flags") or []
+    risk_flags = payload.get("risk_flags") or payload.get("rf") or []
     if not isinstance(risk_flags, list):
         risk_flags = []
     return AIDecision(
         action=action,
-        element_id=(str(payload.get("element_id", "")).strip() or None),
-        input_text=(str(payload.get("input_text", "")).strip() or None),
+        element_id=(str(payload.get("element_id", payload.get("id", "")).strip() or None)),
+        input_text=(str(payload.get("input_text", payload.get("v", "")).strip() or None)),
         confidence=confidence,
-        reason=str(payload.get("reason", ""))[:400],
+        reason=str(payload.get("reason", payload.get("r", "")))[:180],
         risk_flags=[str(x)[:80] for x in risk_flags],
         alternative_element_ids=[str(x)[:80] for x in alt_ids],
     )
