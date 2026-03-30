@@ -12,5 +12,5 @@ token.pickle
 token.json
 *.db
 nul
-/errors
+# /errors
 /error_reports/*

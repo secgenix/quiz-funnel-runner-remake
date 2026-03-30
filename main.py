@@ -1343,9 +1343,13 @@ def detect_paywall_signals(page: Page) -> tuple[bool, str]:
 def resolve_fill_values(config: dict) -> dict:
     runner_cfg = config.get("runner", {}) if isinstance(config.get("runner"), dict) else {}
     fill = config.get("fill_values", {}) or runner_cfg.get("fill_values", {}) or {}
+    email_value = str(fill.get("email", "")).strip()
+    if not email_value:
+        natural_local = f"alexey.quiz{datetime.now().strftime('%m%d')}"
+        email_value = f"{natural_local}@gmail.com"
     return {
         "name": str(fill.get("name", "John")),
-        "email": str(fill.get("email", "testuser{ts}@gmail.com")),
+        "email": email_value,
         "age": str(fill.get("age", "30")),
         "height": str(fill.get("height", "170")),
         "weight": str(fill.get("weight", "70")),
@@ -1972,6 +1976,8 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 placeholder = (inp.get_attribute("placeholder") or "").lower()
                 
                 val = fill_values.get("name", "John")
+                context_text = (page.evaluate("() => document.body.innerText") or "").lower()
+                context_url = page.url.lower()
                 input_hints = " ".join([
                     placeholder,
                     (inp.get_attribute("name") or "").lower(),
@@ -1991,11 +1997,12 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 if is_name_field:
                     is_email_field = False
                 if is_email_field:
-                    email_tpl = fill_values.get("email", "testuser{ts}@gmail.com")
-                    val = email_tpl.replace("{ts}", str(int(time.time())))
+                    email_tpl = fill_values.get("email", "alexey.quiz@gmail.com")
+                    if "{ts}" in email_tpl:
+                        val = email_tpl.replace("{ts}", datetime.now().strftime('%m%d'))
+                    else:
+                        val = email_tpl
                 
-                context_text = (page.evaluate("() => document.body.innerText") or "").lower()
-                context_url = page.url.lower()
                 is_dob_step = DATE_OF_BIRTH_STEP_KEY in context_url
                 is_date_field = (
                     is_dob_step
@@ -2221,24 +2228,35 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                 
                 # Если есть повторная попытка, выбираем элемент с уникальным хешем
                 if repeat_attempt > 0 and len(target_pool) > 1:
+                    if any("get started" in safe_inner_text(el, "").lower() for el in target_pool):
+                        for idx, el in enumerate(target_pool):
+                            txt = safe_inner_text(el, "").lower()
+                            if any(term in txt for term in ["male", "female", "man", "woman"]):
+                                chosen_idx = idx
+                                target = target_pool[chosen_idx]
+                                log_func(f"Повтор стартового экрана: вместо Get Started выбираю вариант #{chosen_idx + 1}")
+                                break
+                    if target is not None:
+                        pass
+                    else:
                     # Получаем хеши уже кликнутого элемента
-                    clicked_hash = element_hashes[0] if element_hashes else None
+                        clicked_hash = element_hashes[0] if element_hashes else None
                     
                     # Ищем элемент с отличающимся хешем
-                    found_different = False
-                    for idx, el_hash in enumerate(element_hashes):
-                        if el_hash and el_hash != clicked_hash:
-                            chosen_idx = idx
-                            target = target_pool[chosen_idx]
-                            found_different = True
-                            log_func(f"Повтор шага: выбран альтернативный элемент #{chosen_idx + 1} (уникальный хеш)")
-                            break
+                        found_different = False
+                        for idx, el_hash in enumerate(element_hashes):
+                            if el_hash and el_hash != clicked_hash:
+                                chosen_idx = idx
+                                target = target_pool[chosen_idx]
+                                found_different = True
+                                log_func(f"Повтор шага: выбран альтернативный элемент #{chosen_idx + 1} (уникальный хеш)")
+                                break
                     
                     # Если все элементы одинаковые, пробуем кликнуть по следующему
-                    if not found_different:
-                        chosen_idx = repeat_attempt % len(target_pool)
-                        target = target_pool[chosen_idx]
-                        log_func(f"Повтор шага: все элементы одинаковые, пробую #{chosen_idx + 1}")
+                        if not found_different:
+                            chosen_idx = repeat_attempt % len(target_pool)
+                            target = target_pool[chosen_idx]
+                            log_func(f"Повтор шага: все элементы одинаковые, пробую #{chosen_idx + 1}")
                 else:
                     chosen_idx = 0
                     for idx, candidate_el in enumerate(target_pool):
@@ -2250,6 +2268,17 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
 
             if not target:
                 if screen_type == 'question':
+                    if cont_btn and any(k in (safe_inner_text(cont_btn, "").lower()) for k in ["start", "get started", "start the test", "take the test", "begin"]):
+                        log_func(f"Для question-экрана без валидных опций нажимаю стартовый CTA: {' '.join(safe_inner_text(cont_btn, '').split())}")
+                        close_popups(page, log_func)
+                        pre_start_hash = get_screen_hash(page)
+                        try:
+                            cont_btn.click(force=True, timeout=1500)
+                        except:
+                            pass
+                        moved = wait_for_transition(page, start_url, pre_start_hash, timeout=8.0)
+                        if moved:
+                            return "question_start_cta_clicked"
                     pre_option_hash = get_screen_hash(page)
                     clicked_option = try_click_question_option_js(
                         page,
