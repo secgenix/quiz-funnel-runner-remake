@@ -1391,6 +1391,111 @@ def warmup_page_for_full_screenshot(page: Page, log_func) -> None:
     except Exception as e:
         log_func(f"Не удалось подготовить полный скриншот: {str(e)[:90]}")
 
+
+def ensure_paywall_plans_marker(page: Page, log_func) -> bool:
+    try:
+        marked = page.evaluate(r"""() => {
+            const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const priceRe = /(?:[$€£₽]\s?\d|\d\s?(?:usd|eur|gbp|rub|₽|\$|€|£)|\b\d+[.,]?\d*\s*\/(?:mo|month|year|yr|week)\b)/i;
+            const planTerms = ['plan', 'pricing', 'subscription', 'premium', 'membership', 'billing', 'monthly', 'yearly', 'annual', 'per month', 'per year', 'week', 'month', 'year', 'trial'];
+            const isVisible = (el) => {
+                if (!el || !el.isConnected) return false;
+                const style = window.getComputedStyle(el);
+                if (!style || style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') < 0.05) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width >= 120 && rect.height >= 80;
+            };
+            const textOf = (el) => normalize([
+                el.innerText || '',
+                el.textContent || '',
+                el.getAttribute('aria-label') || '',
+                el.getAttribute('data-testid') || ''
+            ].join(' '));
+
+            document.querySelectorAll('.paywall_plans').forEach(el => el.classList.remove('paywall_plans'));
+
+            let best = null;
+            let bestScore = -1;
+            const nodes = Array.from(document.querySelectorAll('section, div, main, article, form'));
+            for (const el of nodes) {
+                if (!isVisible(el)) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < Math.min(window.innerWidth * 0.45, 260) || rect.height < 120) continue;
+                const text = textOf(el);
+                if (!text) continue;
+
+                let score = 0;
+                if (priceRe.test(text)) score += 4;
+                for (const term of planTerms) {
+                    if (text.includes(term)) score += 1;
+                }
+
+                const children = Array.from(el.children || []).filter(isVisible);
+                const priceChildren = children.filter(child => priceRe.test(textOf(child))).length;
+                const ctaChildren = children.filter(child => /continue|choose|select|get started|buy|subscribe|start/i.test(textOf(child))).length;
+                if (priceChildren >= 2) score += 6;
+                if (ctaChildren >= 1) score += 2;
+                if (children.length >= 2 && children.length <= 12) score += 1;
+                if (rect.top >= 0 && rect.top < window.innerHeight) score += 1;
+
+                if (score > bestScore) {
+                    best = el;
+                    bestScore = score;
+                }
+            }
+
+            if (!best || bestScore < 6) return false;
+            best.classList.add('paywall_plans');
+            best.setAttribute('data-paywall-plans-score', String(bestScore));
+            return true;
+        }""")
+        if marked:
+            log_func("Paywall plans: контейнер тарифов промаркирован классом paywall_plans")
+        return bool(marked)
+    except Exception as e:
+        log_func(f"Paywall plans: не удалось промаркировать контейнер: {str(e)[:90]}")
+        return False
+
+
+def save_paywall_plans_screenshot(page: Page, full_screenshot_path: str, plans_screenshot_path: str, log_func) -> bool:
+    try:
+        for attempt in range(4):
+            ensure_paywall_plans_marker(page, log_func)
+            locator = page.locator(".paywall_plans").first
+            if locator.count() > 0:
+                try:
+                    locator.scroll_into_view_if_needed(timeout=2500)
+                except Exception:
+                    pass
+                time.sleep(0.35)
+                try:
+                    if locator.is_visible(timeout=1500):
+                        locator.screenshot(path=plans_screenshot_path, timeout=4000)
+                        log_func(f"Paywall plans: сохранен скриншот блока тарифов: {plans_screenshot_path}")
+                        return True
+                except Exception as direct_error:
+                    log_func(f"Paywall plans: element screenshot не удался, пробую fallback: {str(direct_error)[:90]}")
+                    try:
+                        box = locator.bounding_box()
+                    except Exception:
+                        box = None
+                    if box and box.get("width", 0) > 10 and box.get("height", 0) > 10:
+                        clip = {
+                            "x": max(0, float(box.get("x", 0))),
+                            "y": max(0, float(box.get("y", 0))),
+                            "width": max(1, float(box.get("width", 0))),
+                            "height": max(1, float(box.get("height", 0))),
+                        }
+                        page.screenshot(path=plans_screenshot_path, clip=clip)
+                        log_func(f"Paywall plans: сохранен clip fallback блока тарифов: {plans_screenshot_path}")
+                        return True
+            time.sleep(0.5 + attempt * 0.25)
+        log_func(f"Paywall plans: блок тарифов не найден, сохранен только полный paywall screenshot: {full_screenshot_path}")
+        return False
+    except Exception as e:
+        log_func(f"Paywall plans: ошибка сохранения скриншота тарифов: {str(e)[:120]}")
+        return False
+
 def classify_screen(page: Page, log_func):
     def debug_return(ctype, reason):
         if DEBUG_CLASSIFY:
@@ -2726,6 +2831,17 @@ def run_funnel(
                         shutil.copy2(local_path, classified_path)
                         emit_artifact(local_path)
                         emit_artifact(classified_path, drive_subdir=f"_classified/{st}")
+                        if st in ['paywall', 'checkout']:
+                            plans_name = f"{step:02d}_{st}_plans.png"
+                            plans_path = os.path.join(res_dir, plans_name)
+                            classified_plans_path = os.path.join(classified_dir, st, f"{slug}__{plans_name}")
+                            if save_paywall_plans_screenshot(page, local_path, plans_path, log):
+                                try:
+                                    shutil.copy2(plans_path, classified_plans_path)
+                                    emit_artifact(plans_path)
+                                    emit_artifact(classified_plans_path, drive_subdir=f"_classified/{st}")
+                                except Exception as plans_copy_error:
+                                    log(f"Paywall plans: ошибка сохранения classified screenshot: {str(plans_copy_error)[:120]}")
                     except Exception as e:
                         log(f"Ошибка сохранения скриншота: {str(e)[:120]}")
 
