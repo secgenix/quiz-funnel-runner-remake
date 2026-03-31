@@ -300,6 +300,9 @@ class GoogleDriveUploader:
             return self.get_or_create_folder(self.root_folder_name, parent_id)
         return parent_id
 
+    def _resolve_classified_folder_id(self, root_parent_id: str) -> str:
+        return self.get_or_create_folder("_classified", root_parent_id)
+
     def _list_children_map(self, folder_id: str) -> Dict[str, Dict[str, Any]]:
         folder_id = (folder_id or "").strip()
         if not folder_id:
@@ -553,7 +556,7 @@ class GoogleDriveUploader:
                     if not matching_files:
                         continue
                     if classified_folder_id is None:
-                        classified_folder_id = self.get_or_create_folder("_classified", funnel_folder_id)
+                        classified_folder_id = self._resolve_classified_folder_id(root_parent_id)
                     type_folder_id = self.get_or_create_folder(screen_type, classified_folder_id)
                     for file_path in matching_files:
                         if self.upload_file(str(file_path), type_folder_id):
@@ -834,7 +837,12 @@ class ParallelDriveUploadManager:
             try:
                 relative = absolute.resolve().relative_to(result_dir.resolve())
             except Exception:
-                relative = Path(absolute.name)
+                classified_root = result_dir.parent / "_classified"
+                try:
+                    relative = absolute.resolve().relative_to(classified_root.resolve())
+                    relative = Path("_classified") / relative
+                except Exception:
+                    relative = Path(absolute.name)
 
             relative_path = relative.as_posix()
             entries = run["entries"]
@@ -979,7 +987,11 @@ class ParallelDriveUploadManager:
             status = str(entry.get("status") or "")
             if status == "uploaded":
                 continue
-            absolute_path = result_dir / Path(relative_path)
+            relative = Path(relative_path)
+            if relative.parts and relative.parts[0] == "_classified":
+                absolute_path = result_dir.parent / relative
+            else:
+                absolute_path = result_dir / relative
             if not absolute_path.exists() or not absolute_path.is_file():
                 continue
             with self._lock:
@@ -1174,11 +1186,11 @@ class ParallelDriveUploadManager:
             run = self._runs.get(run_id)
             if not run:
                 raise RuntimeError(f"Google Drive run is not registered: {run_id}")
-            parent_folder_id = str(run.get("folder_id") or "")
-            if parent_folder_id and not uploader._folder_exists(parent_folder_id):
-                raise DriveFolderMissingError(parent_folder_id)
+            run_folder_id = str(run.get("folder_id") or "")
+            if run_folder_id and not uploader._folder_exists(run_folder_id):
+                raise DriveFolderMissingError(run_folder_id)
             if not drive_subdir:
-                return parent_folder_id
+                return run_folder_id
             cached = run["target_folders"].get(drive_subdir)
             if cached:
                 if uploader._folder_exists(cached):
@@ -1186,14 +1198,19 @@ class ParallelDriveUploadManager:
                 run["target_folders"].pop(drive_subdir, None)
                 self._write_state_locked(run_id)
 
-        current_folder_id = parent_folder_id
+        root_parent_id = self.folder_id.strip() if self.folder_id else uploader._resolve_root_folder_id()
+        current_folder_id = run_folder_id
+        path_parts = [part.strip() for part in drive_subdir.split("/") if part.strip()]
+        if path_parts and path_parts[0] == "_classified":
+            current_folder_id = uploader._resolve_classified_folder_id(root_parent_id)
+            path_parts = path_parts[1:]
         current_path_parts: List[str] = []
-        for part in drive_subdir.split("/"):
+        for part in path_parts:
             normalized = part.strip()
-            if not normalized:
-                continue
             current_path_parts.append(normalized)
             cache_key = "/".join(current_path_parts)
+            if drive_subdir.startswith("_classified/"):
+                cache_key = f"_classified/{cache_key}"
             with self._lock:
                 run = self._runs.get(run_id)
                 if not run:
