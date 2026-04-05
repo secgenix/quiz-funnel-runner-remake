@@ -629,6 +629,37 @@ def find_paywall_screenshot(task: FunnelTask) -> Optional[str]:
     return None
 
 
+async def send_firecrawl_screenshot_links(
+    bot: Bot, user_id: int, screenshot_urls: List[str]
+) -> None:
+    unique_urls: List[str] = []
+    seen: Set[str] = set()
+    for url in screenshot_urls:
+        normalized = str(url or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_urls.append(normalized)
+
+    if not unique_urls:
+        return
+
+    lines = ["🖼 <b>Firecrawl screenshots</b>"]
+    for index, screenshot_url in enumerate(unique_urls[:10], start=1):
+        lines.append(f'{index}. <a href="{screenshot_url}">screenshot {index}</a>')
+
+    try:
+        await bot.send_message(
+            user_id,
+            "\n".join(lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=build_main_menu(),
+        )
+    except Exception as e:
+        logger.error(f"Ошибка отправки Firecrawl screenshot links: {e}")
+
+
 async def register_start_batch(user_id: int, total_tasks: int) -> None:
     """Регистрирует пакет задач для единого стартового уведомления"""
     if total_tasks <= 1:
@@ -1766,6 +1797,12 @@ class TaskQueueProcessor:
             else:
                 await notify_task_complete(bot, task.user_id, completed_task)
 
+            screenshot_urls = result.get("fallback_screenshot_urls") or []
+            if screenshot_urls:
+                await send_firecrawl_screenshot_links(
+                    bot, task.user_id, screenshot_urls
+                )
+
             # Уведомляем процессор очереди о завершении задачи
             await queue_processor.increment_tasks_completed()
 
@@ -1890,6 +1927,9 @@ def run_funnel_sync_wrapper(
                 - int(result.get("steps_total", 0)),
             ),
             progress_callback=firecrawl_progress,
+            log_callback=lambda message: logger.info(
+                "task_id=%s | %s", task_id, message
+            ),
         )
 
         if firecrawl_result.used:
@@ -1903,6 +1943,7 @@ def run_funnel_sync_wrapper(
             )
             result["fallback_provider"] = firecrawl_result.provider
             result["fallback_status"] = firecrawl_result.status
+            result["fallback_screenshot_urls"] = firecrawl_result.screenshot_urls
             result["steps_total"] = int(result.get("steps_total", 0)) + int(
                 firecrawl_result.steps_total or 0
             )
@@ -1923,6 +1964,13 @@ def run_funnel_sync_wrapper(
                 result["error"] = None
             elif firecrawl_result.error:
                 result["error"] = firecrawl_result.error
+
+            if firecrawl_result.screenshot_urls:
+                logger.info(
+                    "Firecrawl screenshot URLs для task_id=%s: %s",
+                    task_id,
+                    ", ".join(firecrawl_result.screenshot_urls),
+                )
         else:
             logger.warning(
                 "Firecrawl fallback не был использован для task_id=%s | status=%s | error=%s",

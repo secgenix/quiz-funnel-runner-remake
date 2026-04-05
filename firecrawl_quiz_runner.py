@@ -13,6 +13,7 @@ load_dotenv()
 
 
 ProgressCallback = Callable[[int, int, str, Optional[str]], None]
+LogCallback = Callable[[str], None]
 
 
 def _coerce_dict(value: Any) -> dict[str, Any]:
@@ -163,6 +164,7 @@ class FirecrawlFallbackResult:
     paywall_reached: bool
     last_url: str
     last_screenshot: Optional[str]
+    screenshot_urls: list[str]
     progress_message: str
     error: Optional[str]
     provider: str = "firecrawl"
@@ -172,7 +174,15 @@ def run_firecrawl_fallback(
     start_url: str,
     max_steps: int = 25,
     progress_callback: Optional[ProgressCallback] = None,
+    log_callback: Optional[LogCallback] = None,
 ) -> FirecrawlFallbackResult:
+    def log(message: str) -> None:
+        if log_callback:
+            try:
+                log_callback(message)
+            except Exception:
+                pass
+
     api_key = os.getenv("FIRECRAWL_API_KEY", "").strip()
     if not api_key:
         return FirecrawlFallbackResult(
@@ -182,6 +192,7 @@ def run_firecrawl_fallback(
             paywall_reached=False,
             last_url=start_url,
             last_screenshot=None,
+            screenshot_urls=[],
             progress_message="Firecrawl fallback disabled: FIRECRAWL_API_KEY is not set",
             error="firecrawl_api_key_missing",
         )
@@ -190,9 +201,11 @@ def run_firecrawl_fallback(
     current_url = start_url
     scrape_id: Optional[str] = None
     last_screenshot: Optional[str] = None
+    screenshot_urls: list[str] = []
     steps_done = 0
 
     try:
+        log(f"Firecrawl fallback: старт с URL {start_url}")
         initial = app.scrape(
             start_url,
             formats=[
@@ -208,9 +221,14 @@ def run_firecrawl_fallback(
         )
         scrape_id = _extract_scrape_id(initial)
         last_screenshot = _extract_screenshot_url(initial)
+        if last_screenshot:
+            screenshot_urls.append(last_screenshot)
+            log(f"Firecrawl fallback: initial screenshot {last_screenshot}")
+        log(f"Firecrawl fallback: scrape_id={scrape_id}")
 
         for step in range(1, max_steps + 1):
             message = f"Firecrawl fallback: шаг {step}/{max_steps}"
+            log(f"{message} | current_url={current_url}")
             if progress_callback:
                 progress_callback(step, max_steps, message, current_url)
 
@@ -220,6 +238,17 @@ def run_firecrawl_fallback(
             candidate_url = str(state.get("current_url") or "").strip()
             if _is_valid_http_url(candidate_url):
                 current_url = candidate_url
+
+            status = str(state.get("status") or "").strip().lower()
+            summary = str(state.get("summary") or "").strip()
+            selected_answer = str(state.get("selected_answer") or "").strip()
+            next_action = str(state.get("next_action") or "").strip()
+            log(
+                "Firecrawl fallback: interact result "
+                f"status={status or 'unknown'} | url={current_url} | "
+                f"answer={selected_answer or '-'} | next={next_action or '-'} | "
+                f"summary={summary or '-'}"
+            )
 
             screenshot_result = app.scrape(
                 current_url,
@@ -234,12 +263,13 @@ def run_firecrawl_fallback(
                 max_age=0,
                 only_main_content=False,
             )
-            last_screenshot = (
-                _extract_screenshot_url(screenshot_result) or last_screenshot
-            )
+            next_screenshot = _extract_screenshot_url(screenshot_result)
+            if next_screenshot:
+                last_screenshot = next_screenshot
+                if next_screenshot not in screenshot_urls:
+                    screenshot_urls.append(next_screenshot)
+                log(f"Firecrawl fallback: screenshot {next_screenshot}")
 
-            status = str(state.get("status") or "").strip().lower()
-            summary = str(state.get("summary") or "").strip()
             progress_message = (
                 f"Firecrawl fallback: {summary}"
                 if summary
@@ -254,6 +284,7 @@ def run_firecrawl_fallback(
                     paywall_reached=True,
                     last_url=current_url,
                     last_screenshot=last_screenshot,
+                    screenshot_urls=screenshot_urls,
                     progress_message=progress_message,
                     error=None,
                 )
@@ -265,6 +296,7 @@ def run_firecrawl_fallback(
                     paywall_reached=False,
                     last_url=current_url,
                     last_screenshot=last_screenshot,
+                    screenshot_urls=screenshot_urls,
                     progress_message=progress_message,
                     error="firecrawl_unknown_state",
                 )
@@ -278,10 +310,12 @@ def run_firecrawl_fallback(
             paywall_reached=False,
             last_url=current_url,
             last_screenshot=last_screenshot,
+            screenshot_urls=screenshot_urls,
             progress_message="Firecrawl fallback: достигнут лимит шагов",
             error="firecrawl_max_steps_reached",
         )
     except Exception as exc:
+        log(f"Firecrawl fallback: ошибка {str(exc)[:180]}")
         return FirecrawlFallbackResult(
             used=True,
             status="error",
@@ -289,6 +323,7 @@ def run_firecrawl_fallback(
             paywall_reached=False,
             last_url=current_url,
             last_screenshot=last_screenshot,
+            screenshot_urls=screenshot_urls,
             progress_message=f"Firecrawl fallback error: {str(exc)[:160]}",
             error=f"firecrawl_exception:{str(exc)[:180]}",
         )
@@ -296,5 +331,8 @@ def run_firecrawl_fallback(
         if scrape_id:
             try:
                 app.stop_interaction(scrape_id)
+                log(
+                    f"Firecrawl fallback: interaction stopped for scrape_id={scrape_id}"
+                )
             except Exception:
                 pass
