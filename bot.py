@@ -1930,6 +1930,9 @@ def run_funnel_sync_wrapper(
             log_callback=lambda message: logger.info(
                 "task_id=%s | %s", task_id, message
             ),
+            artifact_callback=enqueue_drive_artifact,
+            results_dir=result.get("path") or os.path.join("results", slug),
+            slug=result.get("slug") or slug,
         )
 
         if firecrawl_result.used:
@@ -1958,6 +1961,8 @@ def run_funnel_sync_wrapper(
 
             if firecrawl_result.last_screenshot:
                 result["last_screenshot"] = firecrawl_result.last_screenshot
+            if firecrawl_result.manifest_path:
+                result["manifest_path"] = firecrawl_result.manifest_path
 
             if firecrawl_result.paywall_reached:
                 result["paywall_reached"] = True

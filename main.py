@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -27,6 +27,8 @@ def run_funnel_with_firecrawl(url: str, config: dict, headless: bool) -> dict:
                 - int(result.get("steps_total", 0)),
             ),
             log_callback=lambda message: print(f"[FIRECRAWL] {message}"),
+            results_dir=result.get("path"),
+            slug=result.get("slug"),
         )
 
         if firecrawl_result.used:
@@ -47,6 +49,8 @@ def run_funnel_with_firecrawl(url: str, config: dict, headless: bool) -> dict:
 
             if firecrawl_result.last_screenshot:
                 result["last_screenshot"] = firecrawl_result.last_screenshot
+            if firecrawl_result.manifest_path:
+                result["manifest_path"] = firecrawl_result.manifest_path
 
             if firecrawl_result.paywall_reached:
                 result["paywall_reached"] = True

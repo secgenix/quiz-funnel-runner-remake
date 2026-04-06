@@ -17,6 +17,9 @@ app = Firecrawl(api_key=api_key)
 start_url = "https://quiz.fitme.expert/intro-111?cohort=fitme_fl_111&uuid=5b2bd673-ca18-4212-b346-c75f37cbd47e"
 
 
+SCREENSHOT_DIR = "firecrawltest_screenshots"
+
+
 def extract_output(response: Any) -> str:
     if response is None:
         return ""
@@ -196,6 +199,51 @@ def infer_status_from_text(text: str) -> str:
     return "unknown"
 
 
+def save_current_screen_screenshot(scrape_id: str, step_index: int, label: str) -> str:
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+    screenshot_response = app.interact(
+        scrape_id,
+        code="""await (async () => {
+                const shotBuffer = await page.screenshot({
+                    fullPage: true,
+                    type: 'jpeg',
+                    quality: 70,
+                });
+                return shotBuffer.toString('base64');
+            })();""",
+        language="node",
+    )
+    screenshot_base64 = str(getattr(screenshot_response, "result", "") or "").strip()
+    if screenshot_base64.startswith(
+        ("data:image/png;base64,", "data:image/jpeg;base64,")
+    ):
+        screenshot_base64 = screenshot_base64.split(",", 1)[1].strip()
+
+    if not screenshot_base64:
+        raise RuntimeError("Could not extract base64 screenshot from interact response")
+
+    screenshot_path = os.path.join(
+        SCREENSHOT_DIR,
+        f"step_{step_index:02d}_{label}.jpg",
+    )
+    raw_result = getattr(screenshot_response, "result", b"")
+    with open(screenshot_path, "wb") as screenshot_file:
+        if screenshot_base64.startswith("\x89PNG") or screenshot_base64.startswith(
+            "\ufffdPNG"
+        ):
+            if isinstance(raw_result, bytes):
+                screenshot_file.write(raw_result)
+            else:
+                screenshot_file.write(
+                    str(raw_result).encode("latin-1", errors="ignore")
+                )
+        else:
+            screenshot_file.write(base64.b64decode(screenshot_base64.encode("ascii")))
+
+    print(f"Screenshot saved to: {screenshot_path}")
+    return screenshot_path
+
+
 # 1. Start an interactive scrape session
 result = app.scrape(
     start_url,
@@ -240,6 +288,9 @@ Return only valid JSON in this exact shape:
 """.strip()
 
 current_url = None
+step_index = 0
+
+save_current_screen_screenshot(scrape_id, step_index, "start")
 
 while True:
     try:
@@ -280,6 +331,11 @@ while True:
     status = str(navigation_payload.get("status") or "").strip().lower()
     if not status:
         status = infer_status_from_text(extract_output(navigation_response))
+
+    step_index += 1
+    label = "paywall" if status == "paywall_reached" else "question"
+    save_current_screen_screenshot(scrape_id, step_index, label)
+
     if status == "paywall_reached":
         break
     if status in {"blocked", "unknown", ""}:
@@ -345,38 +401,9 @@ if pricing_payload:
 else:
     print(extract_output(response))
 
-# 5. Capture screenshot from the final paywall screen using the current session
+# 5. Final paywall screenshot path
 print(f"[screenshot] current_url={current_url!r}")
-
-screenshot_response = app.interact(
-    scrape_id,
-    code="""const buffer = await page.screenshot();
-            buffer.toString('base64');""",
-    language="node",
-)
-screenshot_base64 = str(getattr(screenshot_response, "result", "") or "").strip()
-if screenshot_base64.startswith(("data:image/png;base64,", "data:image/jpeg;base64,")):
-    screenshot_base64 = screenshot_base64.split(",", 1)[1].strip()
-
-debug_dump_response("screenshot_interact", screenshot_response)
-print(f"[screenshot] result_preview={screenshot_base64[:120]!r}")
-if not screenshot_base64:
-    raise RuntimeError("Could not extract base64 screenshot from interact response")
-
-screenshot_path = "paywall_screenshot.png"
-raw_result = getattr(screenshot_response, "result", b"")
-with open(screenshot_path, "wb") as screenshot_file:
-    if screenshot_base64.startswith("\x89PNG") or screenshot_base64.startswith(
-        "\ufffdPNG"
-    ):
-        if isinstance(raw_result, bytes):
-            screenshot_file.write(raw_result)
-        else:
-            screenshot_file.write(str(raw_result).encode("latin-1", errors="ignore"))
-    else:
-        screenshot_file.write(base64.b64decode(screenshot_base64.encode("ascii")))
-
-print(f"Screenshot saved to: {screenshot_path}")
+save_current_screen_screenshot(scrape_id, step_index, "paywall_final")
 
 # 6. Stop the session
 app.stop_interaction(scrape_id)
