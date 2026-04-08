@@ -36,8 +36,6 @@ FIRECRAWL_PRE_WAIT_SECONDS = 0.8
 FIRECRAWL_POST_STEP_SLEEP_SECONDS = 0.25
 FIRECRAWL_UNKNOWN_STATE_RETRY_LIMIT = 2
 FIRECRAWL_PROFILE_NAME = "Alex"
-FIRECRAWL_PROFILE_EMAIL = "231321"
-FIRECRAWL_PROFILE_PASSWORD = "1231231"
 FIRECRAWL_PROFILE_GENERIC_VALUE = "27"
 
 FIRECRAWL_MEDIATOR_SYSTEM_PROMPT = """
@@ -704,6 +702,9 @@ class FirecrawlLoopMediator:
 
 
 def _build_interact_prompt(mediator_instruction: str = "") -> str:
+    profile_email = os.getenv("FIRECRAWL_PROFILE_EMAIL", "").strip()
+    profile_password = os.getenv("FIRECRAWL_PROFILE_PASSWORD", "").strip()
+
     prompt = """
 Operate one quiz-funnel browser step.
 
@@ -715,8 +716,8 @@ Prefer the smallest action that changes state. Avoid repeating an ineffective ac
 
 Use these fixed values whenever matching fields are visible:
 - first name / name: Alex
-- email: 231321
-- password / create password: 1231231
+- email: {profile_email}
+- password / create password: {profile_password}
 - height / weight / age / date-of-birth related fields: any plausible value is acceptable; prefer simple adult values such as 27, 170, 70 if needed
 
 Return JSON only:
@@ -731,7 +732,10 @@ Rules:
 - If account creation is required to continue, use the fixed profile values above.
 - Use `unknown` only if safe progress is unclear.
 - Keep fields short.
-""".strip()
+""".strip().format(
+        profile_email=profile_email or "leave unchanged if unavailable",
+        profile_password=profile_password or "leave unchanged if unavailable",
+    )
 
     if mediator_instruction.strip():
         prompt += (
