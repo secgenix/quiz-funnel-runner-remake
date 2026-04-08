@@ -34,7 +34,11 @@ FIRECRAWL_MEDIATOR_MAX_SCREENSHOT_SAVES = 18
 FIRECRAWL_MEDIATOR_AI_STEP_INTERVAL = 2
 FIRECRAWL_PRE_WAIT_SECONDS = 0.8
 FIRECRAWL_POST_STEP_SLEEP_SECONDS = 0.25
-FIRECRAWL_UNKNOWN_STATE_RETRY_LIMIT = 1
+FIRECRAWL_UNKNOWN_STATE_RETRY_LIMIT = 2
+FIRECRAWL_PROFILE_NAME = "Alex"
+FIRECRAWL_PROFILE_EMAIL = "231321"
+FIRECRAWL_PROFILE_PASSWORD = "1231231"
+FIRECRAWL_PROFILE_GENERIC_VALUE = "27"
 
 FIRECRAWL_MEDIATOR_SYSTEM_PROMPT = """
 You prevent looped Firecrawl quiz actions.
@@ -704,18 +708,27 @@ def _build_interact_prompt(mediator_instruction: str = "") -> str:
 Operate one quiz-funnel browser step.
 
 Do exactly one safe action, then stop on the next stable screen.
-If a paywall, pricing, subscription, trial, locked result, checkout, or payment form is visible, stop without clicking purchase controls.
+If profile, onboarding, lead, account creation, signup, checkout, or paywall-adjacent fields are visible, fill the required non-payment fields before stopping.
+You may create an account or continue through the paywall flow, but do not enter card, bank, wallet, or other payment credentials.
 If an answer already seems selected and Continue/Next is visible, click Continue/Next instead of re-answering.
 Prefer the smallest action that changes state. Avoid repeating an ineffective action on an unchanged screen.
+
+Use these fixed values whenever matching fields are visible:
+- first name / name: Alex
+- email: 231321
+- password / create password: 1231231
+- height / weight / age / date-of-birth related fields: any plausible value is acceptable; prefer simple adult values such as 27, 170, 70 if needed
 
 Return JSON only:
 {"status":"advanced|paywall|unknown","screen_type":"question|info|input|email|paywall|checkout|other","summary":"short","selected_answer":"","next_action":"","visible_signals":["short","short"]}
 
 Rules:
-- Use `paywall` status for paywall and checkout.
+- Use `paywall` status only when the next required step is a purchase, subscription choice, checkout, or payment entry.
 - Use `checkout` screen_type when payment entry is visible.
 - Use `paywall` screen_type for pricing/subscription/trial without payment entry.
 - Use `email` for lead capture, `input` for other forms, `info` for loading/transition screens.
+- Fill all visible required non-payment fields needed to continue the funnel before returning `paywall`.
+- If account creation is required to continue, use the fixed profile values above.
 - Use `unknown` only if safe progress is unclear.
 - Keep fields short.
 """.strip()
