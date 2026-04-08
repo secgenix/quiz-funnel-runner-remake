@@ -34,6 +34,7 @@ FIRECRAWL_MEDIATOR_MAX_SCREENSHOT_SAVES = 18
 FIRECRAWL_MEDIATOR_AI_STEP_INTERVAL = 2
 FIRECRAWL_PRE_WAIT_SECONDS = 0.8
 FIRECRAWL_POST_STEP_SLEEP_SECONDS = 0.25
+FIRECRAWL_UNKNOWN_STATE_RETRY_LIMIT = 1
 
 FIRECRAWL_MEDIATOR_SYSTEM_PROMPT = """
 You prevent looped Firecrawl quiz actions.
@@ -287,6 +288,7 @@ def _save_current_screen_screenshot(
                 return shotBuffer.toString('base64');
             })();""",
         language="node",
+        timeout=60,  # 60 seconds timeout for screenshot
     )
     screenshot_base64 = str(getattr(screenshot_response, "result", "") or "").strip()
     if screenshot_base64.startswith(
@@ -732,13 +734,53 @@ def _interact_one_step(
     app: Firecrawl, scrape_id: str, mediator_instruction: str = ""
 ) -> dict[str, Any]:
     response = app.interact(
-        scrape_id, prompt=_build_interact_prompt(mediator_instruction)
+        scrape_id, prompt=_build_interact_prompt(mediator_instruction), timeout=60
     )
     raw_output = _extract_interact_output(response)
     parsed = _parse_interact_json(raw_output)
     parsed["raw_output"] = raw_output
     parsed["_debug_response"] = _debug_response_snapshot(response)
     return parsed
+
+
+def _retry_unknown_state_once(
+    app: Firecrawl,
+    scrape_id: str,
+    state: dict[str, Any],
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    status = str(state.get("status") or "").strip().lower()
+    if status != "unknown":
+        return state
+
+    summary = str(state.get("summary") or "").strip()
+    screen_type = str(
+        state.get("screen_type") or state.get("last_screen_type") or ""
+    ).strip()
+    log(
+        "Firecrawl fallback: unknown state detected, retrying once"
+        f" | type={screen_type or '-'} | summary={summary or '-'}"
+    )
+    time.sleep(FIRECRAWL_PRE_WAIT_SECONDS)
+    retried_state = _interact_one_step(
+        app,
+        scrape_id,
+        mediator_instruction=(
+            "The previous step returned unknown on a likely transitional or informational screen. "
+            "Wait briefly if content is still loading, then make one safe attempt to advance using a visible non-purchase Continue/Next control if it appears. "
+            "Return unknown only if safe progress is still unclear after this retry."
+        ),
+    )
+    retried_status = str(retried_state.get("status") or "").strip().lower()
+    retried_summary = str(retried_state.get("summary") or "").strip()
+    retried_type = str(
+        retried_state.get("screen_type") or retried_state.get("last_screen_type") or ""
+    ).strip()
+    log(
+        "Firecrawl fallback: unknown state retry result"
+        f" status={retried_status or 'unknown'} | type={retried_type or '-'} | summary={retried_summary or '-'}"
+    )
+    return retried_state
 
 
 def _should_save_step_screenshot(
@@ -930,6 +972,13 @@ def run_firecrawl_fallback(
             state = _interact_one_step(
                 app, scrape_id, mediator_instruction=mediator_instruction
             )
+            unknown_retry_count = 0
+            while (
+                str(state.get("status") or "").strip().lower() == "unknown"
+                and unknown_retry_count < FIRECRAWL_UNKNOWN_STATE_RETRY_LIMIT
+            ):
+                state = _retry_unknown_state_once(app, scrape_id, state, log)
+                unknown_retry_count += 1
             steps_done = step
 
             status = str(state.get("status") or "").strip().lower()
@@ -1142,6 +1191,7 @@ def run_firecrawl_fallback(
                             });
                         })();""",
                     language="node",
+                    timeout=60,
                 )
                 log(
                     "Firecrawl fallback: invalid-json page snapshot="
