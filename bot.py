@@ -1105,28 +1105,23 @@ async def cmd_clear(message: Message) -> None:
         await message.answer("❌ Доступ запрещен", parse_mode="HTML")
         return
 
-    # Получаем все задачи пользователя в статусе processing
-    all_tasks = await task_manager.get_user_tasks(user_id, limit=100)
-    stuck_tasks = [t for t in all_tasks if t.status == TaskStatus.PROCESSING]
+    pending_tasks = await task_manager.clear_pending_tasks_for_user(user_id)
+    stuck_tasks = await task_manager.clear_stuck_tasks_for_user(user_id)
+    total_cleared = len(pending_tasks) + len(stuck_tasks)
 
-    if not stuck_tasks:
+    if total_cleared == 0:
         await message.answer("✅ Нет зависших задач.")
         return
 
-    # Сбрасываем статус на failed
-    cleared_count = 0
-    for task in stuck_tasks:
-        await task_manager.update_status(task.id, TaskStatus.FAILED)
-        await task_manager.complete_task(
-            task_id=task.id,
-            steps_total=0,
-            paywall_reached=False,
-            error="Task stuck, cleared by user",
-        )
-        cleared_count += 1
-
     await message.answer(
-        f"✅ Очищено зависших задач: <b>{cleared_count}</b>",
+        "✅ Очищено задач: "
+        f"<b>{total_cleared}</b>"
+        + (
+            f"\n⏳ Удалено из ожидания: <b>{len(pending_tasks)}</b>"
+            if pending_tasks
+            else ""
+        )
+        + (f"\n🧹 Сброшено зависших: <b>{len(stuck_tasks)}</b>" if stuck_tasks else ""),
         parse_mode="HTML",
         reply_markup=build_main_menu(),
     )
@@ -1338,16 +1333,12 @@ async def handle_url_message(message: Message, state: FSMContext) -> None:
         await register_start_batch(user_id, added_count)
 
     # Создаем задачи только для доступных слотов
-    user_tasks = await task_manager.get_user_tasks(
-        user_id, limit=MAX_QUEUE_PER_USER + 1
-    )
-    pending_count = sum(1 for t in user_tasks if t.status == TaskStatus.PENDING)
-    active_count = await task_manager.get_active_task_count()
-    available_slots = MAX_CONCURRENT_TASKS - active_count
-    max_pending = MAX_QUEUE_PER_USER - pending_count
+    active_user_task_count = await task_manager.get_active_task_count_for_user(user_id)
+    available_user_slots = MAX_CONCURRENT_TASKS - active_user_task_count
+    max_pending = MAX_QUEUE_PER_USER - active_user_task_count
 
     # Создаем задачи в доступных слотах
-    urls_to_create = min(available_slots, max_pending, added_count)
+    urls_to_create = min(available_user_slots, max_pending, added_count)
 
     created_tasks = []
     if urls_to_create > 0:
@@ -1604,9 +1595,7 @@ class TaskQueueProcessor:
             return 0
         all_tasks = await task_manager.get_all_tasks(limit=500)
         active_tasks = [
-            task
-            for task in all_tasks
-            if task.status in (TaskStatus.PENDING, TaskStatus.PROCESSING)
+            task for task in all_tasks if task.status == TaskStatus.PROCESSING
         ]
         stop_count = 0
         for task in active_tasks:
@@ -1637,27 +1626,14 @@ class TaskQueueProcessor:
 
     async def _process_queued_urls(self):
         """Обработка URL из очереди"""
-        # Получаем активных задач
-        active_count = await task_manager.get_active_task_count()
-        available_slots = MAX_CONCURRENT_TASKS - active_count
-
-        if available_slots <= 0:
-            return
-
         # Получаем всех пользователей с URL в очереди
         user_ids = await task_manager.get_all_users_with_queued_urls()
 
         for user_id in user_ids:
-            # Проверяем сколько у пользователя pending задач
-            user_tasks = await task_manager.get_user_tasks(
-                user_id, limit=MAX_QUEUE_PER_USER + 1
+            active_user_task_count = await task_manager.get_active_task_count_for_user(
+                user_id
             )
-            pending_count = sum(1 for t in user_tasks if t.status == TaskStatus.PENDING)
-
-            # Если есть свободные слоты
-            user_available = min(
-                MAX_CONCURRENT_TASKS - active_count, MAX_QUEUE_PER_USER - pending_count
-            )
+            user_available = MAX_CONCURRENT_TASKS - active_user_task_count
             if user_available > 0:
                 # Получаем URL из очереди
                 queued_urls = await task_manager.pop_queued_urls(
@@ -1682,20 +1658,24 @@ class TaskQueueProcessor:
         if not pending_tasks:
             return
 
-        # Проверяем количество активных задач
-        active_count = await task_manager.get_active_task_count()
-        available_slots = MAX_CONCURRENT_TASKS - active_count
-
-        if available_slots <= 0:
-            return
-
-        # Запускаем задачи в доступных слотах
-        tasks_to_run = pending_tasks[:available_slots]
-
-        for task in tasks_to_run:
+        for task in pending_tasks:
             # Проверяем, не начала ли задача уже выполняться
             current_task = await task_manager.get_task(task.id)
+            if not current_task or current_task.status != TaskStatus.PENDING:
+                continue
+
+            active_user_task_count = await task_manager.get_active_task_count_for_user(
+                task.user_id
+            )
+            if active_user_task_count >= MAX_CONCURRENT_TASKS:
+                continue
+
             if current_task and current_task.status == TaskStatus.PENDING:
+                logger.info(
+                    "Пользователь %s: запуск pending-задачи #%s",
+                    task.user_id,
+                    task.id,
+                )
                 self._track_active_task(asyncio.create_task(self._execute_task(task)))
 
     async def _execute_task(self, task: FunnelTask) -> None:
@@ -2029,6 +2009,7 @@ async def start_bot() -> None:
     bot = Bot(token=cfg.bot.token)
     dp = Dispatcher(storage=MemoryStorage())
     task_manager = TaskManager()
+    restored_pending = await task_manager.reactivate_cancelled_pending_tasks()
     thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TASKS)
     drive_upload_executor = ThreadPoolExecutor(
         max_workers=max(1, cfg.google_drive.max_parallel_uploads)
@@ -2090,6 +2071,8 @@ async def start_bot() -> None:
     logger.info(f"🤖 Бот запущен...")
     logger.info(f"📊 Максимум одновременных задач: {MAX_CONCURRENT_TASKS}")
     logger.info(f"📋 Максимум задач в очереди на пользователя: {MAX_QUEUE_PER_USER}")
+    if restored_pending:
+        logger.info("♻️ Восстановлено отмененных до запуска задач: %s", restored_pending)
 
     # Запускаем процессор очереди
     await queue_processor.start()

@@ -1,6 +1,7 @@
 """
 Модели данных для Quiz Funnel Runner
 """
+
 import sqlite3
 import json
 import asyncio
@@ -16,16 +17,18 @@ logger = logging.getLogger(__name__)
 
 class TaskStatus(str, Enum):
     """Статусы задач"""
-    PENDING = "pending"       # В очереди
-    PROCESSING = "processing" # В процессе
-    COMPLETED = "completed"   # Завершено успешно
-    FAILED = "failed"         # Ошибка
-    CANCELLED = "cancelled"   # Отменено пользователем
+
+    PENDING = "pending"  # В очереди
+    PROCESSING = "processing"  # В процессе
+    COMPLETED = "completed"  # Завершено успешно
+    FAILED = "failed"  # Ошибка
+    CANCELLED = "cancelled"  # Отменено пользователем
 
 
 @dataclass
 class FunnelTask:
     """Задача на прохождение воронки"""
+
     id: int
     user_id: int
     url: str
@@ -55,7 +58,9 @@ class FunnelTask:
             "status": self.status.value,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "completed_at": self.completed_at.isoformat()
+            if self.completed_at
+            else None,
             "steps_total": self.steps_total,
             "paywall_reached": self.paywall_reached,
             "error": self.error,
@@ -67,7 +72,9 @@ class FunnelTask:
             "progress_message": self.progress_message,
             "current_step": self.current_step,
             "stop_requested": self.stop_requested,
-            "stop_requested_at": self.stop_requested_at.isoformat() if self.stop_requested_at else None,
+            "stop_requested_at": self.stop_requested_at.isoformat()
+            if self.stop_requested_at
+            else None,
         }
 
     @classmethod
@@ -92,7 +99,9 @@ class FunnelTask:
             progress_message=row[15] or "",
             current_step=row[16] or 0,
             stop_requested=bool(row[17]) if len(row) > 17 else False,
-            stop_requested_at=datetime.fromisoformat(row[18]) if len(row) > 18 and row[18] else None,
+            stop_requested_at=datetime.fromisoformat(row[18])
+            if len(row) > 18 and row[18]
+            else None,
         )
 
 
@@ -138,11 +147,17 @@ class TaskManager:
         if "last_url" not in existing_columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN last_url TEXT")
         if "progress_message" not in existing_columns:
-            cursor.execute("ALTER TABLE tasks ADD COLUMN progress_message TEXT DEFAULT ''")
+            cursor.execute(
+                "ALTER TABLE tasks ADD COLUMN progress_message TEXT DEFAULT ''"
+            )
         if "current_step" not in existing_columns:
-            cursor.execute("ALTER TABLE tasks ADD COLUMN current_step INTEGER DEFAULT 0")
+            cursor.execute(
+                "ALTER TABLE tasks ADD COLUMN current_step INTEGER DEFAULT 0"
+            )
         if "stop_requested" not in existing_columns:
-            cursor.execute("ALTER TABLE tasks ADD COLUMN stop_requested INTEGER DEFAULT 0")
+            cursor.execute(
+                "ALTER TABLE tasks ADD COLUMN stop_requested INTEGER DEFAULT 0"
+            )
         if "stop_requested_at" not in existing_columns:
             cursor.execute("ALTER TABLE tasks ADD COLUMN stop_requested_at TEXT")
 
@@ -177,10 +192,13 @@ class TaskManager:
             cursor = conn.cursor()
 
             now = datetime.now().isoformat()
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO tasks (user_id, url, status, created_at)
                 VALUES (?, ?, ?, ?)
-            """, (user_id, url, TaskStatus.PENDING.value, now))
+            """,
+                (user_id, url, TaskStatus.PENDING.value, now),
+            )
 
             task_id = cursor.lastrowid
             conn.commit()
@@ -212,12 +230,15 @@ class TaskManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT * FROM tasks 
             WHERE user_id = ? 
             ORDER BY created_at DESC 
             LIMIT ?
-        """, (user_id, limit))
+        """,
+            (user_id, limit),
+        )
 
         rows = cursor.fetchall()
         conn.close()
@@ -229,11 +250,14 @@ class TaskManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT * FROM tasks 
             WHERE status = ? 
             ORDER BY created_at ASC
-        """, (TaskStatus.PENDING.value,))
+        """,
+            (TaskStatus.PENDING.value,),
+        )
 
         rows = cursor.fetchall()
         conn.close()
@@ -254,12 +278,15 @@ class TaskManager:
         cursor = conn.cursor()
 
         placeholders = ", ".join("?" for _ in statuses)
-        cursor.execute(f"""
+        cursor.execute(
+            f"""
             SELECT * FROM tasks
             WHERE user_id = ? AND status IN ({placeholders})
             ORDER BY created_at DESC
             LIMIT ?
-        """, (user_id, *[status.value for status in statuses], limit))
+        """,
+            (user_id, *[status.value for status in statuses], limit),
+        )
 
         rows = cursor.fetchall()
         conn.close()
@@ -279,23 +306,35 @@ class TaskManager:
                 params.append(datetime.now().isoformat())
                 updates.append("stop_requested = 0")
                 updates.append("stop_requested_at = NULL")
-            elif status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            elif status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ):
                 updates.append("completed_at = ?")
                 params.append(datetime.now().isoformat())
 
             params.append(task_id)
-            cursor.execute(f"""
+            cursor.execute(
+                f"""
                 UPDATE tasks 
-                SET {', '.join(updates)}
+                SET {", ".join(updates)}
                 WHERE id = ?
-            """, params)
+            """,
+                params,
+            )
 
             conn.commit()
             conn.close()
 
-    async def update_progress(self, task_id: int, current_step: int,
-                              total_steps: int, message: str = "",
-                              last_url: Optional[str] = None) -> None:
+    async def update_progress(
+        self,
+        task_id: int,
+        current_step: int,
+        total_steps: int,
+        message: str = "",
+        last_url: Optional[str] = None,
+    ) -> None:
         """Обновление прогресса задачи"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
@@ -308,30 +347,39 @@ class TaskManager:
                 params.append(last_url)
             params.append(task_id)
 
-            cursor.execute(f"""
+            cursor.execute(
+                f"""
                 UPDATE tasks
-                SET {', '.join(updates)}
+                SET {", ".join(updates)}
                 WHERE id = ?
-            """, params)
+            """,
+                params,
+            )
 
             conn.commit()
             conn.close()
 
-    async def complete_task(self, task_id: int, steps_total: int, 
-                           paywall_reached: bool, error: Optional[str] = None,
-                           screenshot_path: Optional[str] = None,
-                           log_path: Optional[str] = None,
-                           manifest_path: Optional[str] = None,
-                           drive_folder_url: Optional[str] = None,
-                            last_url: Optional[str] = None,
-                            final_status: Optional[TaskStatus] = None,
-                            progress_message: Optional[str] = None) -> None:
+    async def complete_task(
+        self,
+        task_id: int,
+        steps_total: int,
+        paywall_reached: bool,
+        error: Optional[str] = None,
+        screenshot_path: Optional[str] = None,
+        log_path: Optional[str] = None,
+        manifest_path: Optional[str] = None,
+        drive_folder_url: Optional[str] = None,
+        last_url: Optional[str] = None,
+        final_status: Optional[TaskStatus] = None,
+        progress_message: Optional[str] = None,
+    ) -> None:
         """Завершение задачи с результатами"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
 
-            cursor.execute("""
+            cursor.execute(
+                """
                 UPDATE tasks 
                 SET status = ?, completed_at = ?, steps_total = ?, 
                     paywall_reached = ?, error = ?, 
@@ -339,20 +387,25 @@ class TaskManager:
                     manifest_path = ?, drive_folder_url = ?,
                     last_url = ?, progress_message = ?, stop_requested = 0
                 WHERE id = ?
-            """, (
-                (final_status or (TaskStatus.FAILED if error else TaskStatus.COMPLETED)).value,
-                datetime.now().isoformat(),
-                steps_total,
-                paywall_reached,
-                error,
-                screenshot_path,
-                log_path,
-                manifest_path,
-                drive_folder_url,
-                last_url,
-                progress_message or "",
-                task_id,
-            ))
+            """,
+                (
+                    (
+                        final_status
+                        or (TaskStatus.FAILED if error else TaskStatus.COMPLETED)
+                    ).value,
+                    datetime.now().isoformat(),
+                    steps_total,
+                    paywall_reached,
+                    error,
+                    screenshot_path,
+                    log_path,
+                    manifest_path,
+                    drive_folder_url,
+                    last_url,
+                    progress_message or "",
+                    task_id,
+                ),
+            )
 
             conn.commit()
             conn.close()
@@ -377,28 +430,34 @@ class TaskManager:
             now = datetime.now().isoformat()
 
             if status == TaskStatus.PENDING:
-                cursor.execute("""
+                cursor.execute(
+                    """
                     UPDATE tasks
                     SET status = ?, completed_at = ?, stop_requested = 0,
                         stop_requested_at = ?, progress_message = ?
                     WHERE id = ?
-                """, (
-                    TaskStatus.CANCELLED.value,
-                    now,
-                    now,
-                    "Остановлено до запуска",
-                    task_id,
-                ))
+                """,
+                    (
+                        TaskStatus.CANCELLED.value,
+                        now,
+                        now,
+                        "Остановлено до запуска",
+                        task_id,
+                    ),
+                )
             elif status == TaskStatus.PROCESSING:
-                cursor.execute("""
+                cursor.execute(
+                    """
                     UPDATE tasks
                     SET stop_requested = 1, stop_requested_at = ?, progress_message = ?
                     WHERE id = ?
-                """, (
-                    now,
-                    "Запрошена остановка, ожидается безопасное завершение текущего шага",
-                    task_id,
-                ))
+                """,
+                    (
+                        now,
+                        "Запрошена остановка, ожидается безопасное завершение текущего шага",
+                        task_id,
+                    ),
+                )
             else:
                 conn.close()
                 return False
@@ -422,6 +481,41 @@ class TaskManager:
                 stopped_ids.append(task.id)
         return stopped_ids
 
+    async def clear_pending_tasks_for_user(self, user_id: int) -> List[FunnelTask]:
+        """Удаляет ожидающие задачи пользователя, которые еще не стартовали."""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT * FROM tasks
+                WHERE user_id = ? AND status = ?
+                ORDER BY created_at DESC
+                """,
+                (user_id, TaskStatus.PENDING.value),
+            )
+            rows = cursor.fetchall()
+
+            if not rows:
+                conn.close()
+                return []
+
+            task_ids = [row[0] for row in rows]
+            placeholders = ", ".join("?" for _ in task_ids)
+            cursor.execute(
+                f"""
+                DELETE FROM tasks
+                WHERE id IN ({placeholders})
+                """,
+                task_ids,
+            )
+
+            conn.commit()
+            conn.close()
+
+            return [FunnelTask.from_row(row) for row in rows]
+
     async def is_stop_requested(self, task_id: int) -> bool:
         """Проверяет, запрошена ли остановка для задачи."""
         conn = sqlite3.connect(self.db_path)
@@ -436,15 +530,112 @@ class TaskManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT COUNT(*) FROM tasks
             WHERE status = ?
-        """, (TaskStatus.PROCESSING.value,))
+        """,
+            (TaskStatus.PROCESSING.value,),
+        )
 
         count = cursor.fetchone()[0]
         conn.close()
 
         return count
+
+    async def get_active_task_count_for_user(self, user_id: int) -> int:
+        """Получение количества выполняющихся задач конкретного пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM tasks
+            WHERE user_id = ? AND status = ?
+            """,
+            (user_id, TaskStatus.PROCESSING.value),
+        )
+
+        count = cursor.fetchone()[0]
+        conn.close()
+
+        return count
+
+    async def clear_stuck_tasks_for_user(self, user_id: int) -> List[FunnelTask]:
+        """Сбрасывает зависшие processing-задачи только указанного пользователя."""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT * FROM tasks
+                WHERE user_id = ? AND status = ?
+                ORDER BY created_at DESC
+                """,
+                (user_id, TaskStatus.PROCESSING.value),
+            )
+            rows = cursor.fetchall()
+
+            if not rows:
+                conn.close()
+                return []
+
+            now = datetime.now().isoformat()
+            cleared_ids = [row[0] for row in rows]
+            placeholders = ", ".join("?" for _ in cleared_ids)
+            cursor.execute(
+                f"""
+                UPDATE tasks
+                SET status = ?,
+                    completed_at = ?,
+                    error = ?,
+                    stop_requested = 0,
+                    stop_requested_at = ?,
+                    progress_message = ?
+                WHERE id IN ({placeholders})
+                """,
+                [
+                    TaskStatus.FAILED.value,
+                    now,
+                    "Task stuck, cleared by user",
+                    now,
+                    "Задача была сброшена пользователем",
+                    *cleared_ids,
+                ],
+            )
+
+            conn.commit()
+            conn.close()
+
+            return [FunnelTask.from_row(row) for row in rows]
+
+    async def reactivate_cancelled_pending_tasks(self) -> int:
+        """Возвращает в очередь отмененные до запуска задачи после рестарта."""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET status = ?,
+                    completed_at = NULL,
+                    progress_message = '',
+                    stop_requested = 0,
+                    stop_requested_at = NULL
+                WHERE status = ?
+                  AND started_at IS NULL
+                  AND (error IS NULL OR error = '')
+                """,
+                (TaskStatus.PENDING.value, TaskStatus.CANCELLED.value),
+            )
+            restored = cursor.rowcount or 0
+
+            conn.commit()
+            conn.close()
+
+            return restored
 
     # ====================
     # Методы для очереди URL
@@ -453,11 +644,11 @@ class TaskManager:
     async def add_urls_to_queue(self, user_id: int, urls: List[str]) -> int:
         """
         Добавление списка URL в очередь
-        
+
         Args:
             user_id: ID пользователя
             urls: Список URL
-            
+
         Returns:
             Количество добавленных URL
         """
@@ -467,13 +658,16 @@ class TaskManager:
 
             now = datetime.now().isoformat()
             added_count = 0
-            
+
             for url in urls:
                 try:
-                    cursor.execute("""
+                    cursor.execute(
+                        """
                         INSERT INTO url_queue (user_id, url, created_at)
                         VALUES (?, ?, ?)
-                    """, (user_id, url, now))
+                    """,
+                        (user_id, url, now),
+                    )
                     added_count += 1
                 except Exception as e:
                     logger.debug(f"Ошибка добавления URL в очередь: {e}")
@@ -488,10 +682,13 @@ class TaskManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT COUNT(*) FROM url_queue
             WHERE user_id = ?
-        """, (user_id,))
+        """,
+            (user_id,),
+        )
 
         count = cursor.fetchone()[0]
         conn.close()
@@ -501,11 +698,11 @@ class TaskManager:
     async def pop_queued_urls(self, user_id: int, limit: int) -> List[str]:
         """
         Получение и удаление URL из очереди
-        
+
         Args:
             user_id: ID пользователя
             limit: Максимальное количество URL
-            
+
         Returns:
             Список URL
         """
@@ -514,12 +711,15 @@ class TaskManager:
             cursor = conn.cursor()
 
             # Получаем URL
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT id, url FROM url_queue
                 WHERE user_id = ?
                 ORDER BY created_at ASC
                 LIMIT ?
-            """, (user_id, limit))
+            """,
+                (user_id, limit),
+            )
 
             rows = cursor.fetchall()
             urls = [row[1] for row in rows]
@@ -527,11 +727,14 @@ class TaskManager:
 
             # Удаляем полученные URL
             if ids:
-                placeholders = ','.join('?' * len(ids))
-                cursor.execute(f"""
+                placeholders = ",".join("?" * len(ids))
+                cursor.execute(
+                    f"""
                     DELETE FROM url_queue
                     WHERE id IN ({placeholders})
-                """, ids)
+                """,
+                    ids,
+                )
 
             conn.commit()
             conn.close()
@@ -558,11 +761,14 @@ class TaskManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT * FROM tasks
             ORDER BY created_at DESC
             LIMIT ?
-        """, (limit,))
+        """,
+            (limit,),
+        )
 
         rows = cursor.fetchall()
         conn.close()

@@ -4,12 +4,17 @@ import os
 import re
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Optional
 
 from dotenv import load_dotenv
 from firecrawl import Firecrawl
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 load_dotenv()
 
@@ -17,6 +22,42 @@ load_dotenv()
 ProgressCallback = Callable[[int, int, str, Optional[str]], None]
 LogCallback = Callable[[str], None]
 ArtifactCallback = Callable[[str, str], None]
+
+FIRECRAWL_MEDIATOR_MODEL = "gpt-5.4-nano"
+FIRECRAWL_MEDIATOR_MAX_HISTORY = 6
+FIRECRAWL_MEDIATOR_SCREEN_CACHE = 4
+FIRECRAWL_MEDIATOR_REPEAT_THRESHOLD = 2
+FIRECRAWL_MEDIATOR_PATTERN_THRESHOLD = 2
+FIRECRAWL_MEDIATOR_STATE_LIMIT = 700
+FIRECRAWL_MEDIATOR_MAX_WAIT_STREAK = 1
+FIRECRAWL_MEDIATOR_MAX_SCREENSHOT_SAVES = 18
+FIRECRAWL_MEDIATOR_AI_STEP_INTERVAL = 2
+FIRECRAWL_PRE_WAIT_SECONDS = 0.8
+FIRECRAWL_POST_STEP_SLEEP_SECONDS = 0.25
+
+FIRECRAWL_MEDIATOR_SYSTEM_PROMPT = """
+You prevent looped Firecrawl quiz actions.
+
+Input includes current screen, short recent history, repeat counters, cached screen fingerprints, and the default next action.
+
+Decide one:
+- proceed
+- force_alternative
+- wait
+- stop_paywall
+- stop_unknown
+
+Rules:
+- Repeated same-action or same-screen states mean loop risk.
+- If answer already seems selected and Continue/Next is visible, prefer that instead of re-answering.
+- Do not suggest buying, checkout, payment, or subscription actions.
+- Use wait only for likely in-progress transitions and not repeatedly.
+- Use stop_paywall for paywall or checkout.
+- Use stop_unknown when safe progress is unlikely.
+
+Return JSON only:
+{"decision":"proceed|force_alternative|wait|stop_paywall|stop_unknown","reason":"short","loop_detected":true,"screen_changed":true,"recommended_instruction":"short","recommended_action_tag":"short","confidence":0.0,"signals":["short"]}
+""".strip()
 
 
 def _coerce_dict(value: Any) -> dict[str, Any]:
@@ -92,6 +133,35 @@ def _parse_interact_json(raw_output: str) -> dict[str, Any]:
 def _compact_debug_text(value: Any, limit: int = 800) -> str:
     text = str(value or "").replace("\r", " ").replace("\n", "\\n")
     return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _trim_list(values: list[Any], item_limit: int, text_limit: int) -> list[str]:
+    result: list[str] = []
+    for value in values[:item_limit]:
+        text = str(value or "").strip()
+        if text:
+            result.append(text[:text_limit])
+    return result
+
+
+def _stable_text_fingerprint(*parts: str) -> str:
+    combined = " | ".join(
+        re.sub(r"\s+", " ", str(part or "")).strip().lower()
+        for part in parts
+        if str(part or "").strip()
+    )
+    return combined[:FIRECRAWL_MEDIATOR_STATE_LIMIT]
+
+
+def _extract_state_signature(payload: dict[str, Any]) -> str:
+    return _stable_text_fingerprint(
+        str(payload.get("status") or ""),
+        str(payload.get("screen_type") or payload.get("last_screen_type") or ""),
+        str(payload.get("summary") or payload.get("raw_output") or ""),
+        " | ".join(
+            str(x) for x in payload.get("visible_signals", []) if str(x).strip()
+        ),
+    )
 
 
 def _debug_response_snapshot(response: Any) -> dict[str, Any]:
@@ -275,48 +345,430 @@ def _write_manifest(
     return manifest_path
 
 
-def _interact_one_step(app: Firecrawl, scrape_id: str) -> dict[str, Any]:
+@dataclass
+class FirecrawlActionRecord:
+    step: int
+    timestamp: str
+    status: str
+    screen_type: str
+    summary: str
+    selected_answer: str
+    next_action: str
+    action_tag: str
+    state_signature: str
+    raw_output_preview: str
+
+
+@dataclass
+class FirecrawlMediatorDecision:
+    decision: str = "proceed"
+    reason: str = ""
+    loop_detected: bool = False
+    screen_changed: bool = True
+    recommended_instruction: str = ""
+    recommended_action_tag: str = ""
+    confidence: float = 0.0
+    signals: list[str] = field(default_factory=list)
+    source: str = "rules"
+
+
+class FirecrawlLoopMediator:
+    def __init__(
+        self,
+        log_func: Callable[[str], None],
+        artifact_callback: Optional[ArtifactCallback] = None,
+    ):
+        self.log = log_func
+        self.artifact_callback = artifact_callback
+        self.history: list[FirecrawlActionRecord] = []
+        self.screen_cache: list[str] = []
+        self.same_action_streak = 0
+        self.same_state_streak = 0
+        self.wait_streak = 0
+        self.ai_call_counter = 0
+        self.last_action_tag = ""
+        self.last_state_signature = ""
+        self._client: Any = None
+
+    def _client_or_none(self) -> Any:
+        if self._client is not None:
+            return self._client
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key or OpenAI is None:
+            return None
+        try:
+            self._client = OpenAI(api_key=api_key, timeout=8)
+        except Exception:
+            self._client = None
+        return self._client
+
+    def _build_action_tag(self, payload: dict[str, Any]) -> str:
+        return _stable_text_fingerprint(
+            str(payload.get("selected_answer") or ""),
+            str(payload.get("next_action") or ""),
+            str(payload.get("summary") or ""),
+        )
+
+    def analyze_before_step(
+        self, step: int, state_hint: Optional[dict[str, Any]] = None
+    ) -> FirecrawlMediatorDecision:
+        screen_type = str((state_hint or {}).get("screen_type") or "")
+        if screen_type in {"paywall", "checkout"}:
+            return FirecrawlMediatorDecision(
+                decision="stop_paywall",
+                reason="paywall_or_checkout_state_hint",
+                loop_detected=False,
+                screen_changed=True,
+                confidence=1.0,
+                signals=[screen_type],
+            )
+        return self._decide_with_rules(step)
+
+    def analyze_after_step(
+        self, step: int, payload: dict[str, Any], output_dir: str
+    ) -> FirecrawlMediatorDecision:
+        state_signature = _extract_state_signature(payload)
+        action_tag = self._build_action_tag(payload)
+        previous_signature = self.last_state_signature
+        screen_changed = bool(state_signature and state_signature != previous_signature)
+
+        if action_tag and action_tag == self.last_action_tag:
+            self.same_action_streak += 1
+        else:
+            self.same_action_streak = 1 if action_tag else 0
+        if state_signature and state_signature == previous_signature:
+            self.same_state_streak += 1
+        else:
+            self.same_state_streak = 1 if state_signature else 0
+        self.last_action_tag = action_tag
+        self.last_state_signature = state_signature
+
+        record = FirecrawlActionRecord(
+            step=step,
+            timestamp=datetime.now().isoformat(),
+            status=str(payload.get("status") or ""),
+            screen_type=str(
+                payload.get("screen_type") or payload.get("last_screen_type") or ""
+            ),
+            summary=str(payload.get("summary") or "")[:280],
+            selected_answer=str(payload.get("selected_answer") or "")[:160],
+            next_action=str(payload.get("next_action") or "")[:160],
+            action_tag=action_tag,
+            state_signature=state_signature,
+            raw_output_preview=_compact_debug_text(
+                payload.get("raw_output") or "", 500
+            ),
+        )
+        self.history.append(record)
+        self.history = self.history[-FIRECRAWL_MEDIATOR_MAX_HISTORY:]
+        if state_signature:
+            self.screen_cache.append(state_signature)
+            self.screen_cache = self.screen_cache[-FIRECRAWL_MEDIATOR_SCREEN_CACHE:]
+
+        decision = self._decide_with_ai(step, payload, screen_changed)
+        self._persist_debug(output_dir, step, payload, decision)
+        return decision
+
+    def _decide_with_rules(self, step: int) -> FirecrawlMediatorDecision:
+        repeated_screen_count = (
+            self.screen_cache.count(self.last_state_signature)
+            if self.last_state_signature
+            else 0
+        )
+        loop_detected = (
+            self.same_action_streak >= FIRECRAWL_MEDIATOR_REPEAT_THRESHOLD
+            and repeated_screen_count >= FIRECRAWL_MEDIATOR_PATTERN_THRESHOLD
+        ) or self.same_state_streak >= FIRECRAWL_MEDIATOR_REPEAT_THRESHOLD
+        if loop_detected:
+            latest = self.history[-1] if self.history else None
+            has_continue_signal = any(
+                token in (latest.state_signature if latest else "")
+                for token in ["continue button", "continue", "next button", "next"]
+            )
+            return FirecrawlMediatorDecision(
+                decision="force_alternative",
+                reason="repeated_action_on_same_screen",
+                loop_detected=True,
+                screen_changed=False,
+                recommended_instruction=(
+                    "The screen appears unchanged after recent actions. Do not repeat the previous answer. If a visible Continue or Next control exists, click it once. Otherwise choose a different safe visible option or safe form field."
+                    if has_continue_signal
+                    else "The screen appears unchanged after recent actions. Avoid repeating the previous answer or CTA. Choose a different safe visible option, fill the next safe field, or use a non-purchase Continue/Next control if present."
+                ),
+                recommended_action_tag="break_loop_alternative",
+                confidence=0.9,
+                signals=[
+                    f"same_action_streak={self.same_action_streak}",
+                    f"repeated_screen_count={repeated_screen_count}",
+                    f"same_state_streak={self.same_state_streak}",
+                ],
+            )
+        return FirecrawlMediatorDecision(
+            decision="proceed",
+            reason=f"no_loop_detected_step_{step}",
+            loop_detected=False,
+            screen_changed=True,
+            confidence=0.7,
+            signals=[f"same_action_streak={self.same_action_streak}"],
+        )
+
+    def _decide_with_ai(
+        self, step: int, payload: dict[str, Any], screen_changed: bool
+    ) -> FirecrawlMediatorDecision:
+        if str(payload.get("status") or "").strip().lower() == "paywall":
+            return FirecrawlMediatorDecision(
+                decision="stop_paywall",
+                reason="firecrawl_reported_paywall",
+                loop_detected=False,
+                screen_changed=screen_changed,
+                confidence=1.0,
+                signals=["status=paywall"],
+            )
+
+        rule_decision = self._decide_with_rules(step)
+        if (
+            rule_decision.decision != "proceed"
+            or step == 1
+            or self.same_state_streak >= FIRECRAWL_MEDIATOR_REPEAT_THRESHOLD
+            or self.same_action_streak >= FIRECRAWL_MEDIATOR_REPEAT_THRESHOLD
+        ):
+            should_use_ai = True
+        else:
+            should_use_ai = step % FIRECRAWL_MEDIATOR_AI_STEP_INTERVAL == 0
+        if not should_use_ai:
+            return rule_decision
+
+        client = self._client_or_none()
+        if client is None:
+            return rule_decision
+
+        self.ai_call_counter += 1
+
+        repeated_screen_count = (
+            self.screen_cache.count(self.last_state_signature)
+            if self.last_state_signature
+            else 0
+        )
+        request_payload = {
+            "step": step,
+            "current": {
+                "status": str(payload.get("status") or "")[:16],
+                "screen_type": str(
+                    payload.get("screen_type") or payload.get("last_screen_type") or ""
+                )[:20],
+                "summary": str(payload.get("summary") or "")[:140],
+                "selected_answer": str(payload.get("selected_answer") or "")[:90],
+                "next_action": str(payload.get("next_action") or "")[:90],
+                "visible_signals": _trim_list(
+                    payload.get("visible_signals", []), 4, 40
+                ),
+                "state_signature": self.last_state_signature[:180],
+            },
+            "history": [
+                {
+                    "s": item.step,
+                    "st": item.status[:16],
+                    "t": item.screen_type[:20],
+                    "sum": item.summary[:90],
+                    "a": item.selected_answer[:50],
+                    "n": item.next_action[:50],
+                    "tag": item.action_tag[:70],
+                    "sig": item.state_signature[:120],
+                }
+                for item in self.history[-FIRECRAWL_MEDIATOR_MAX_HISTORY:]
+            ],
+            "screen_cache": [
+                signature[:120]
+                for signature in self.screen_cache[-FIRECRAWL_MEDIATOR_SCREEN_CACHE:]
+            ],
+            "same_action_streak": self.same_action_streak,
+            "same_state_streak": self.same_state_streak,
+            "wait_streak": self.wait_streak,
+            "repeated_screen_count": repeated_screen_count,
+            "rule": {
+                "d": rule_decision.decision,
+                "r": rule_decision.reason[:80],
+                "i": rule_decision.recommended_instruction[:140],
+            },
+            "screen_changed": screen_changed,
+        }
+        try:
+            response = client.responses.create(
+                model=FIRECRAWL_MEDIATOR_MODEL,
+                input=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": FIRECRAWL_MEDIATOR_SYSTEM_PROMPT,
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": json.dumps(request_payload, ensure_ascii=False),
+                            }
+                        ],
+                    },
+                ],
+                text={"format": {"type": "json_object"}},
+                max_output_tokens=120,
+            )
+            output_text = getattr(response, "output_text", "") or "{}"
+            raw = json.loads(output_text)
+            decision = FirecrawlMediatorDecision(
+                decision=str(raw.get("decision") or "proceed").strip().lower()
+                or "proceed",
+                reason=str(raw.get("reason") or "")[:220],
+                loop_detected=bool(raw.get("loop_detected", False)),
+                screen_changed=bool(raw.get("screen_changed", screen_changed)),
+                recommended_instruction=str(raw.get("recommended_instruction") or "")[
+                    :400
+                ],
+                recommended_action_tag=str(raw.get("recommended_action_tag") or "")[
+                    :120
+                ],
+                confidence=max(0.0, min(1.0, float(raw.get("confidence", 0.0) or 0.0))),
+                signals=[str(x)[:80] for x in raw.get("signals", [])[:8]]
+                if isinstance(raw.get("signals"), list)
+                else [],
+                source="gpt-5.4-nano",
+            )
+            if decision.decision not in {
+                "proceed",
+                "force_alternative",
+                "wait",
+                "stop_paywall",
+                "stop_unknown",
+            }:
+                return rule_decision
+            if (
+                decision.decision == "wait"
+                and self.wait_streak >= FIRECRAWL_MEDIATOR_MAX_WAIT_STREAK
+            ):
+                return FirecrawlMediatorDecision(
+                    decision="force_alternative",
+                    reason="wait_limit_reached",
+                    loop_detected=True,
+                    screen_changed=screen_changed,
+                    recommended_instruction="Do not wait again. The page has already been rechecked multiple times. Try a different safe visible action such as Continue/Next or a different answer choice instead of repeating the same click.",
+                    recommended_action_tag="escalate_after_wait_limit",
+                    confidence=0.88,
+                    signals=[f"wait_streak={self.wait_streak}"],
+                )
+            return decision
+        except Exception as exc:
+            self.log(f"Firecrawl mediator: AI decision error {str(exc)[:180]}")
+            return rule_decision
+
+    def _persist_debug(
+        self,
+        output_dir: str,
+        step: int,
+        payload: dict[str, Any],
+        decision: FirecrawlMediatorDecision,
+    ) -> None:
+        try:
+            debug_dir = os.path.join(output_dir, "mediator")
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, f"{step:02d}_mediator.json")
+            with open(debug_path, "w", encoding="utf-8") as debug_file:
+                json.dump(
+                    {
+                        "step": step,
+                        "history": [asdict(item) for item in self.history],
+                        "screen_cache": self.screen_cache,
+                        "same_action_streak": self.same_action_streak,
+                        "same_state_streak": self.same_state_streak,
+                        "wait_streak": self.wait_streak,
+                        "current_payload": payload,
+                        "decision": asdict(decision),
+                    },
+                    debug_file,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            _emit_artifact(debug_path, self.artifact_callback, drive_subdir="mediator")
+        except Exception:
+            pass
+
+
+def _build_interact_prompt(mediator_instruction: str = "") -> str:
     prompt = """
-You are operating a quiz funnel in a browser.
+Operate one quiz-funnel browser step.
 
-Your task for this call:
-1. Inspect the current screen.
-2. Decide whether the current screen is:
-   - a normal quiz/question/progress screen that should be advanced by exactly one step,
-   - an input/email/form screen that should be safely completed by exactly one step,
-   - an informational/loading/transition/results-prep screen that should be advanced if safe,
-   - or a monetization barrier, including any paywall, checkout, subscription offer, purchase screen, pricing screen, locked results screen, trial offer, or other screen asking the user to pay or subscribe.
-3. If it is not a monetization barrier, complete exactly one safe next step and stop as soon as the next screen finishes loading.
-4. If it is a monetization barrier, do not continue further, do not click purchase-related controls, and stop immediately.
+Do exactly one safe action, then stop on the next stable screen.
+If a paywall, pricing, subscription, trial, locked result, checkout, or payment form is visible, stop without clicking purchase controls.
+If an answer already seems selected and Continue/Next is visible, click Continue/Next instead of re-answering.
+Prefer the smallest action that changes state. Avoid repeating an ineffective action on an unchanged screen.
 
-Return only valid JSON with this exact schema:
-{
-  "status": "advanced" | "paywall" | "unknown",
-  "screen_type": "question" | "info" | "input" | "email" | "paywall" | "checkout" | "other",
-  "summary": "short human-readable summary of what you saw and did",
-  "selected_answer": "string or empty string",
-  "next_action": "string or empty string",
-  "visible_signals": ["short phrase", "short phrase"]
-}
+Return JSON only:
+{"status":"advanced|paywall|unknown","screen_type":"question|info|input|email|paywall|checkout|other","summary":"short","selected_answer":"","next_action":"","visible_signals":["short","short"]}
 
 Rules:
-- Output JSON only, with no markdown fences and no extra text.
-- Use status "paywall" for both paywall and checkout screens.
-- Use screen_type "checkout" if payment details or card/payment form is visible.
-- Use screen_type "paywall" if plans/pricing/subscription/trial offer is visible without payment entry.
-- Use screen_type "email" for lead capture/email collection.
-- Use screen_type "input" for other form fields.
-- Use screen_type "info" for loading, transitions, analysis, or preparation screens.
-- If you advanced the funnel by one step, use status "advanced".
-- If you are genuinely uncertain or cannot act safely, use status "unknown".
+- Use `paywall` status for paywall and checkout.
+- Use `checkout` screen_type when payment entry is visible.
+- Use `paywall` screen_type for pricing/subscription/trial without payment entry.
+- Use `email` for lead capture, `input` for other forms, `info` for loading/transition screens.
+- Use `unknown` only if safe progress is unclear.
+- Keep fields short.
 """.strip()
 
-    response = app.interact(scrape_id, prompt=prompt)
+    if mediator_instruction.strip():
+        prompt += (
+            "\n\nAdditional coordinator instruction:\n"
+            f"- {mediator_instruction.strip()}\n"
+            "- Do not repeat the exact same ineffective action if the screen appears unchanged.\n"
+            "- Prefer one safe action, then stop after the next stable screen."
+        )
+    return prompt
+
+
+def _interact_one_step(
+    app: Firecrawl, scrape_id: str, mediator_instruction: str = ""
+) -> dict[str, Any]:
+    response = app.interact(
+        scrape_id, prompt=_build_interact_prompt(mediator_instruction)
+    )
     raw_output = _extract_interact_output(response)
     parsed = _parse_interact_json(raw_output)
     parsed["raw_output"] = raw_output
     parsed["_debug_response"] = _debug_response_snapshot(response)
     return parsed
+
+
+def _should_save_step_screenshot(
+    step: int,
+    screen_type: str,
+    state: dict[str, Any],
+    mediator_decision: FirecrawlMediatorDecision,
+    previous_state_signature: str,
+    screenshots_saved: int,
+) -> bool:
+    current_signature = _extract_state_signature(state)
+    if step <= 3:
+        return True
+    if screenshots_saved >= FIRECRAWL_MEDIATOR_MAX_SCREENSHOT_SAVES:
+        return False
+    if str(state.get("status") or "").strip().lower() in {"paywall", "unknown"}:
+        return True
+    if screen_type in {"paywall", "checkout", "email", "input"}:
+        return True
+    if mediator_decision.decision in {
+        "force_alternative",
+        "stop_paywall",
+        "stop_unknown",
+    }:
+        return True
+    if mediator_decision.loop_detected:
+        return True
+    if current_signature and current_signature != previous_state_signature:
+        return True
+    return False
 
 
 @dataclass
@@ -388,6 +840,8 @@ def run_firecrawl_fallback(
     screenshot_entries: list[dict[str, Any]] = []
     steps_done = 0
     progress_message = ""
+    mediator = FirecrawlLoopMediator(log, artifact_callback)
+    screenshots_saved = 1
 
     try:
         log(f"Firecrawl fallback: старт с URL {start_url}")
@@ -429,7 +883,53 @@ def run_firecrawl_fallback(
             if progress_callback:
                 progress_callback(step, max_steps, message, None)
 
-            state = _interact_one_step(app, scrape_id)
+            pre_decision = mediator.analyze_before_step(step)
+            if pre_decision.decision == "stop_paywall":
+                progress_message = (
+                    "Firecrawl fallback: mediator stopped on paywall hint"
+                )
+                manifest_path = _write_manifest(
+                    output_dir,
+                    start_url,
+                    "success",
+                    steps_done,
+                    True,
+                    None,
+                    progress_message,
+                    screenshot_entries,
+                    artifact_callback,
+                )
+                return FirecrawlFallbackResult(
+                    used=True,
+                    status="paywall",
+                    steps_total=steps_done,
+                    paywall_reached=True,
+                    last_url=start_url,
+                    last_screenshot=last_screenshot,
+                    screenshot_urls=screenshot_urls,
+                    progress_message=progress_message,
+                    error=None,
+                    manifest_path=manifest_path,
+                )
+
+            mediator_instruction = ""
+            if pre_decision.decision == "force_alternative":
+                mediator_instruction = pre_decision.recommended_instruction
+                log(
+                    "Firecrawl mediator: forcing alternative before interact | "
+                    f"reason={pre_decision.reason}"
+                )
+            elif pre_decision.decision == "wait":
+                log("Firecrawl mediator: wait before interact")
+                mediator.wait_streak += 1
+                time.sleep(FIRECRAWL_PRE_WAIT_SECONDS)
+            else:
+                mediator.wait_streak = 0
+
+            previous_state_signature = mediator.last_state_signature
+            state = _interact_one_step(
+                app, scrape_id, mediator_instruction=mediator_instruction
+            )
             steps_done = step
 
             status = str(state.get("status") or "").strip().lower()
@@ -456,20 +956,46 @@ def run_firecrawl_fallback(
                     f"{json.dumps(debug_response, ensure_ascii=False, default=str)}"
                 )
 
-            last_screenshot = _save_current_screen_screenshot(
-                app,
-                scrape_id,
-                output_dir,
-                classified_dir,
-                safe_slug,
+            mediator_decision = mediator.analyze_after_step(step, state, output_dir)
+            log(
+                "Firecrawl mediator: decision "
+                f"decision={mediator_decision.decision} | source={mediator_decision.source} | "
+                f"reason={mediator_decision.reason or '-'} | signals={','.join(mediator_decision.signals) or '-'}"
+            )
+
+            if mediator_decision.decision == "wait":
+                mediator.wait_streak += 1
+            else:
+                mediator.wait_streak = 0
+
+            if _should_save_step_screenshot(
                 step,
                 screen_type,
-                artifact_callback,
-            )
-            screenshot_entries.append(
-                {"step": step, "type": screen_type, "path": last_screenshot}
-            )
-            log(f"Firecrawl fallback: screenshot {last_screenshot}")
+                state,
+                mediator_decision,
+                previous_state_signature,
+                screenshots_saved,
+            ):
+                last_screenshot = _save_current_screen_screenshot(
+                    app,
+                    scrape_id,
+                    output_dir,
+                    classified_dir,
+                    safe_slug,
+                    step,
+                    screen_type,
+                    artifact_callback,
+                )
+                screenshot_entries.append(
+                    {"step": step, "type": screen_type, "path": last_screenshot}
+                )
+                screenshots_saved += 1
+                log(f"Firecrawl fallback: screenshot {last_screenshot}")
+            else:
+                log(
+                    "Firecrawl fallback: screenshot skipped | "
+                    f"step={step} | reason=unchanged_non_terminal_state"
+                )
 
             progress_message = (
                 f"Firecrawl fallback: {summary}"
@@ -501,6 +1027,56 @@ def run_firecrawl_fallback(
                     error=None,
                     manifest_path=manifest_path,
                 )
+            if mediator_decision.decision == "stop_paywall":
+                manifest_path = _write_manifest(
+                    output_dir,
+                    start_url,
+                    "success",
+                    steps_done,
+                    True,
+                    None,
+                    progress_message or "Firecrawl mediator stopped at paywall",
+                    screenshot_entries,
+                    artifact_callback,
+                )
+                return FirecrawlFallbackResult(
+                    used=True,
+                    status="paywall",
+                    steps_total=steps_done,
+                    paywall_reached=True,
+                    last_url=start_url,
+                    last_screenshot=last_screenshot,
+                    screenshot_urls=screenshot_urls,
+                    progress_message=progress_message
+                    or "Firecrawl mediator stopped at paywall",
+                    error=None,
+                    manifest_path=manifest_path,
+                )
+            if mediator_decision.decision == "stop_unknown":
+                manifest_path = _write_manifest(
+                    output_dir,
+                    start_url,
+                    "completed",
+                    steps_done,
+                    False,
+                    "firecrawl_mediator_stop_unknown",
+                    progress_message or "Firecrawl mediator stopped due to loop risk",
+                    screenshot_entries,
+                    artifact_callback,
+                )
+                return FirecrawlFallbackResult(
+                    used=True,
+                    status="unknown",
+                    steps_total=steps_done,
+                    paywall_reached=False,
+                    last_url=start_url,
+                    last_screenshot=last_screenshot,
+                    screenshot_urls=screenshot_urls,
+                    progress_message=progress_message
+                    or "Firecrawl mediator stopped due to loop risk",
+                    error="firecrawl_mediator_stop_unknown",
+                    manifest_path=manifest_path,
+                )
             if status == "unknown":
                 manifest_path = _write_manifest(
                     output_dir,
@@ -526,7 +1102,7 @@ def run_firecrawl_fallback(
                     manifest_path=manifest_path,
                 )
 
-            time.sleep(1)
+            time.sleep(FIRECRAWL_POST_STEP_SLEEP_SECONDS)
 
         manifest_path = _write_manifest(
             output_dir,
@@ -557,7 +1133,7 @@ def run_firecrawl_fallback(
         if "Invalid JSON response" in str(exc):
             try:
                 debug_response = app.interact(
-                    scrape_id,
+                    str(scrape_id or ""),
                     code="""await (async () => {
                             return JSON.stringify({
                                 url: page.url(),
