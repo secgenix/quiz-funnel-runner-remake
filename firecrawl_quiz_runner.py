@@ -35,6 +35,8 @@ FIRECRAWL_MEDIATOR_AI_STEP_INTERVAL = 2
 FIRECRAWL_PRE_WAIT_SECONDS = 0.8
 FIRECRAWL_POST_STEP_SLEEP_SECONDS = 0.25
 FIRECRAWL_UNKNOWN_STATE_RETRY_LIMIT = 2
+FIRECRAWL_EXECUTION_TIMEOUT_RETRY_LIMIT = 1
+FIRECRAWL_RUN_RESTART_LIMIT = 1
 FIRECRAWL_PROFILE_NAME = "Alex"
 FIRECRAWL_PROFILE_GENERIC_VALUE = "27"
 
@@ -705,7 +707,7 @@ def _build_interact_prompt(mediator_instruction: str = "") -> str:
     profile_email = os.getenv("FIRECRAWL_PROFILE_EMAIL", "").strip()
     profile_password = os.getenv("FIRECRAWL_PROFILE_PASSWORD", "").strip()
 
-    prompt = """
+    prompt = f"""
 Operate one quiz-funnel browser step.
 
 Do exactly one safe action, then stop on the next stable screen.
@@ -721,7 +723,7 @@ Use these fixed values whenever matching fields are visible:
 - height / weight / age / date-of-birth related fields: any plausible value is acceptable; prefer simple adult values such as 27, 170, 70 if needed
 
 Return JSON only:
-{"status":"advanced|paywall|unknown","screen_type":"question|info|input|email|paywall|checkout|other","summary":"short","selected_answer":"","next_action":"","visible_signals":["short","short"]}
+{{"status":"advanced|paywall|unknown","screen_type":"question|info|input|email|paywall|checkout|other","summary":"short","selected_answer":"","next_action":"","visible_signals":["short","short"]}}
 
 Rules:
 - Use `paywall` status only when the next required step is a purchase, subscription choice, checkout, or payment entry.
@@ -732,10 +734,7 @@ Rules:
 - If account creation is required to continue, use the fixed profile values above.
 - Use `unknown` only if safe progress is unclear.
 - Keep fields short.
-""".strip().format(
-        profile_email=profile_email or "leave unchanged if unavailable",
-        profile_password=profile_password or "leave unchanged if unavailable",
-    )
+""".strip()
 
     if mediator_instruction.strip():
         prompt += (
@@ -800,6 +799,49 @@ def _retry_unknown_state_once(
     return retried_state
 
 
+def _is_execution_timeout_error(exc: Exception) -> bool:
+    return "Firecrawl: Execution timed out" in str(exc)
+
+
+@dataclass
+class FirecrawlInteractAttemptResult:
+    state: Optional[dict[str, Any]] = None
+    restart_requested: bool = False
+    timed_out: bool = False
+
+
+def _interact_one_step_with_timeout_retry(
+    app: Firecrawl,
+    scrape_id: str,
+    log: Callable[[str], None],
+    mediator_instruction: str = "",
+) -> FirecrawlInteractAttemptResult:
+    timeout_retries = 0
+    while True:
+        try:
+            return FirecrawlInteractAttemptResult(
+                state=_interact_one_step(
+                    app, scrape_id, mediator_instruction=mediator_instruction
+                )
+            )
+        except Exception as exc:
+            if not _is_execution_timeout_error(exc):
+                raise
+            if timeout_retries >= FIRECRAWL_EXECUTION_TIMEOUT_RETRY_LIMIT:
+                log(
+                    "Firecrawl fallback: repeated execution timeout, requesting full restart"
+                )
+                return FirecrawlInteractAttemptResult(
+                    restart_requested=True,
+                    timed_out=True,
+                )
+            timeout_retries += 1
+            log(
+                "Firecrawl fallback: execution timeout detected, retrying interact once"
+            )
+            time.sleep(FIRECRAWL_PRE_WAIT_SECONDS)
+
+
 def _should_save_step_screenshot(
     step: int,
     screen_type: str,
@@ -853,6 +895,7 @@ def run_firecrawl_fallback(
     artifact_callback: Optional[ArtifactCallback] = None,
     results_dir: Optional[str] = None,
     slug: Optional[str] = None,
+    _restart_attempt: int = 0,
 ) -> FirecrawlFallbackResult:
     def log(message: str) -> None:
         if log_callback:
@@ -986,9 +1029,51 @@ def run_firecrawl_fallback(
                 mediator.wait_streak = 0
 
             previous_state_signature = mediator.last_state_signature
-            state = _interact_one_step(
-                app, scrape_id, mediator_instruction=mediator_instruction
+            interact_attempt = _interact_one_step_with_timeout_retry(
+                app,
+                scrape_id,
+                log,
+                mediator_instruction=mediator_instruction,
             )
+            if interact_attempt.restart_requested:
+                if _restart_attempt >= FIRECRAWL_RUN_RESTART_LIMIT:
+                    manifest_path = _write_manifest(
+                        output_dir,
+                        start_url,
+                        "completed",
+                        steps_done,
+                        False,
+                        "firecrawl_execution_timeout_restart_limit",
+                        "Firecrawl fallback error: execution timeout restart limit reached",
+                        screenshot_entries,
+                        artifact_callback,
+                    )
+                    return FirecrawlFallbackResult(
+                        used=True,
+                        status="error",
+                        steps_total=steps_done,
+                        paywall_reached=False,
+                        last_url=start_url,
+                        last_screenshot=last_screenshot,
+                        screenshot_urls=screenshot_urls,
+                        progress_message="Firecrawl fallback error: execution timeout restart limit reached",
+                        error="firecrawl_execution_timeout_restart_limit",
+                        manifest_path=manifest_path,
+                    )
+                log(
+                    "Firecrawl fallback: restarting run from scratch after repeated execution timeout"
+                )
+                return run_firecrawl_fallback(
+                    start_url=start_url,
+                    max_steps=max_steps,
+                    progress_callback=progress_callback,
+                    log_callback=log_callback,
+                    artifact_callback=artifact_callback,
+                    results_dir=results_dir,
+                    slug=slug,
+                    _restart_attempt=_restart_attempt + 1,
+                )
+            state = interact_attempt.state or {}
             unknown_retry_count = 0
             while (
                 str(state.get("status") or "").strip().lower() == "unknown"
