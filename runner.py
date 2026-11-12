@@ -27,7 +27,9 @@ FORBIDDEN_PATTERN = re.compile(r"\b(" + "|".join(re.escape(w) for w in SHARE_BLA
 FILLABLE_INPUT_SELECTOR = (
     "input:visible:not([type='hidden']):not([type='radio']):not([type='checkbox']):"
     "not([type='submit']):not([type='button']):not([type='image']):not([type='reset']):"
-    "not([type='file']), textarea:visible"
+    "not([type='file']):not([tabindex='-1']):not([aria-hidden='true']):"
+    "not([name*='honeypot' i]):not([name^='bt_']), "
+    "textarea:visible:not([tabindex='-1']):not([aria-hidden='true'])"
 )
 CONSENT_TEXT_KEYS = [
     "terms", "privacy", "policy", "by continuing", "agree", "consent",
@@ -2137,6 +2139,17 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
                     else:
                         val = fill_values.get("default_number", "25")
                 
+                if not is_email_field and not is_date_field:
+                    field_hint = " ".join([
+                        placeholder, context_url, itype,
+                        (inp.get_attribute("name") or ""), (inp.get_attribute("autocomplete") or ""),
+                        (inp.get_attribute("id") or ""),
+                    ]).lower()
+                    if any(k in field_hint for k in ["zip", "postal", "postcode", "post code", "индекс"]):
+                        val = fill_values.get("zip", "10001")
+                    elif itype == "tel" or any(k in field_hint for k in ["phone", "телефон"]):
+                        val = fill_values.get("phone", "2025550143")
+
                 try:
                     log_func(f"Заполнение поля: тип={itype}, значение={val}")
                     if is_date_field:
@@ -2605,6 +2618,173 @@ def perform_action(page: Page, screen_type: str, log_func, results_dir: str, sta
     except Exception as e: return f"err:{str(e)}"
     return "none"
 
+GENERIC_ADVANCE_FORBIDDEN = [
+    "cookie", "privacy", "terms", "policy", "share", "back", "previous", "назад",
+    "log in", "login", "sign in", "apple", "google", "facebook", "app store",
+    "contact", "support", "help", "menu", "restore", "pay", "buy", "checkout",
+    "subscribe", "purchase", "оплат", "купить",
+]
+
+
+def generic_advance(page: Page, log_func, attempt: int = 0) -> bool:
+    """
+    Последний рубеж перед зацикливанием: специализированные обработчики не
+    сдвинули экран. Кликаем настоящим указателем (page.mouse), а не синтетическим
+    событием — на части React-воронок синтетический click не засчитывается.
+
+    Порядок: активная кнопка продолжения → если она выключена, ждём таймер и
+    добираем варианты ответа (мультивыбор с минимумом отметок) → иначе самый
+    «кнопочный» элемент экрана.
+    """
+    script = (
+        "(args) => {\n"
+        + _js_interaction_helpers()
+        + "const positive = args.positive, forbidden = args.forbidden;\n"
+        + "const isCta = (text) => positive.some(k => text === k || text.startsWith(k + ' ') || text.endsWith(' ' + k));\n"
+        + "const isChosen = (el) => !!(el.matches('[aria-pressed=\"true\"], [aria-checked=\"true\"], [aria-selected=\"true\"], [data-qfr-ga]')\n"
+        + "  || /(^|[\\s_-])(selected|active|checked|chosen)([\\s_-]|$)/i.test(String(el.className || ''))\n"
+        + "  || el.querySelector('input:checked'));\n"
+        + "const nodes = Array.from(document.querySelectorAll(\"button, [role='button'], a, input[type='submit'], input[type='button'], label, div, span\"));\n"
+        + "const ctas = [], options = []; let waiting = null;\n"
+        + "for (const el of nodes) {\n"
+        + "  if (!isElementVisible(el)) continue;\n"
+        + "  const text = getElementText(el);\n"
+        + "  if (!text || text.length > 80) continue;\n"
+        + "  if (forbidden.some(k => text.includes(k))) continue;\n"
+        + "  if (el.closest('header, nav, footer')) continue;\n"
+        + "  const r = el.getBoundingClientRect();\n"
+        + "  if (r.width < 40 || r.height < 28) continue;\n"
+        + "  const inView = r.top >= 0 && r.bottom <= window.innerHeight;\n"
+        + "  if (inView && r.bottom < window.innerHeight * 0.14) continue;\n"
+        + "  const cta = isCta(text);\n"
+        + "  if (isDisabledElement(el)) { if (cta) waiting = text; continue; }\n"
+        + "  if (!isProbablyClickable(el)) continue;\n"
+        + "  const tag = (el.tagName || '').toLowerCase();\n"
+        + "  let score = 0;\n"
+        + "  if (tag === 'button' || tag === 'input') score += 25;\n"
+        + "  if (normalizeText(el.getAttribute('role') || '') === 'button') score += 15;\n"
+        + "  if (viewportRatio(r) >= 0.6) score += 15;\n"
+        + "  if (inView && r.top > window.innerHeight * 0.5) score += 15;\n"
+        + "  if (inView) score += isTopMostForClick(el) ? 30 : -40;\n"
+        + "  (cta ? ctas : options).push({ el, text, score: score + (cta ? 60 : 0) });\n"
+        + "}\n"
+        + "if (!waiting && !(ctas.length && ctas.some(c => c.score >= 60))) {\n"
+        + "  const hidden = document.querySelector(\"button[type='submit'][disabled], button[disabled][data-testid*='submit' i], button[disabled][data-testid*='continue' i]\");\n"
+        + "  if (hidden) waiting = normalizeText(hidden.innerText || hidden.getAttribute('title') || 'continue') || 'continue';\n"
+        + "}\n"
+        + "const byScore = (a, b) => b.score - a.score;\n"
+        + "ctas.sort(byScore);\n"
+        + "let pick = null, kind = null;\n"
+        + "if (args.want !== 'option' && ctas.length && ctas[0].score >= 60) { pick = ctas[0]; kind = 'cta'; }\n"
+        + "else if (args.want === 'option' || waiting) {\n"
+        + "  const leaf = options.filter(o => !options.some(x => x.el !== o.el && o.el.contains(x.el)));\n"
+        + "  const free = leaf.filter(o => !isChosen(o.el) && !o.el.closest('[data-qfr-ga]') && !(o.el.closest('label') && isChosen(o.el.closest('label'))) && o.text.length <= 40);\n"
+        + "  if (free.length) {\n"
+        + "    const stride = Math.max(1, Math.floor(free.length / Math.max(1, args.picksLeft)));\n"
+        + "    pick = free[Math.min(free.length - 1, args.pickIndex > 0 ? stride : 0)]; kind = 'option';\n"
+        + "  }\n"
+        + "} else {\n"
+        + "  options.sort(byScore);\n"
+        + "  const cand = options[Math.min(args.attempt, Math.max(options.length - 1, 0))];\n"
+        + "  if (cand && cand.score >= 60) { pick = cand; kind = 'any'; }\n"
+        + "}\n"
+        + "if (!pick) return { waiting };\n"
+        + "pick.el.scrollIntoView({ block: 'center', inline: 'center' });\n"
+        + "if (kind === 'option') (pick.el.closest('label') || pick.el).setAttribute('data-qfr-ga', '1');\n"
+        + "const r = pick.el.getBoundingClientRect();\n"
+        + "return { kind, waiting, x: r.left + r.width / 2, y: r.top + r.height / 2, text: pick.text, score: pick.score };\n"
+        + "}"
+    )
+    try:
+        pre_url, pre_hash = page.url, get_screen_hash(page)
+        args = {
+            "positive": [k.lower() for k in ACTION_KEYWORDS],
+            "forbidden": GENERIC_ADVANCE_FORBIDDEN,
+            "attempt": max(0, int(attempt)),
+            "want": "auto",
+            "pickIndex": 0,
+            "picksLeft": 8,
+        }
+
+        def moved() -> bool:
+            return page.url != pre_url or get_screen_hash(page) != pre_hash
+
+        def click(target, label: str) -> None:
+            log_func(f"{label}: '{str(target.get('text') or '')[:40]}'")
+            time.sleep(0.25)
+            page.mouse.click(float(target["x"]), float(target["y"]))
+
+        target = page.evaluate(script, args)
+        if target.get("kind") in ("cta", "any"):
+            click(target, "Запасной клик указателем")
+            return wait_for_transition(page, pre_url, pre_hash, timeout=6.0)
+
+        if not target.get("waiting"):
+            return False
+
+        # Кнопка продолжения есть, но выключена: либо таймер, либо мало отметок.
+        log_func(f"Кнопка '{str(target.get('waiting'))[:30]}' пока неактивна: жду и добираю варианты")
+        deadline = time.time() + 20.0
+        extra_clicks = 0
+        waited_once = False
+        while time.time() < deadline:
+            if moved():
+                return True
+            state = page.evaluate(script, args)
+            if state.get("kind") == "cta":
+                click(state, "Кнопка стала активной, нажимаю")
+                return wait_for_transition(page, pre_url, pre_hash, timeout=6.0)
+            if not waited_once:
+                waited_once = True
+                time.sleep(2.5)
+                continue
+            if state.get("kind") == "option" and extra_clicks < 8:
+                extra_clicks += 1
+                args["pickIndex"] = extra_clicks
+                args["picksLeft"] = max(1, 8 - extra_clicks)
+                click(state, f"Добираю вариант #{extra_clicks}")
+                time.sleep(0.7)
+                continue
+            time.sleep(0.6)
+        return moved()
+    except Exception as e:
+        log_func(f"Запасной клик: ошибка: {str(e)[:80]}")
+        return False
+
+
+PRICE_PATTERN = re.compile(
+    r"(?:[$€£₽]\s?\d{1,4}(?:[.,]\d{1,2})?|\d{1,4}(?:[.,]\d{1,2})?\s?(?:USD|EUR|GBP|RUB|₽|\$|€|£))"
+)
+
+
+def extract_prices(page: Page, limit: int = 8) -> list:
+    """Цены с экрана оплаты в порядке появления, без повторов."""
+    try:
+        text = page.evaluate("() => document.body.innerText || ''") or ""
+    except Exception:
+        return []
+    seen, prices = set(), []
+    for raw in PRICE_PATTERN.findall(text):
+        price = re.sub(r"\s+", "", raw)
+        if price in seen or not re.search(r"[1-9]", price):
+            continue
+        seen.add(price)
+        prices.append(price)
+        if len(prices) >= limit:
+            break
+    return prices
+
+
+def reset_result_dir(res_dir: str) -> None:
+    """Убрать артефакты прошлого прогона этой же воронки, чтобы шаги не смешивались."""
+    try:
+        for name in os.listdir(res_dir):
+            if re.match(r"^\d{2}_.+\.png$", name) or name in ("manifest.json", "temp_upload.png"):
+                os.remove(os.path.join(res_dir, name))
+    except Exception:
+        pass
+
+
 def load_runner_config(config_path: str = 'config.json') -> dict:
     with open(config_path, 'r', encoding='utf-8') as f:
         return json.load(f)
@@ -2617,9 +2797,14 @@ def run_funnel(
     progress_callback=None,
     stop_event=None,
     artifact_callback=None,
-    write_manifest: bool = False,
+    write_manifest: bool = True,
 ):
     slug = get_slug(url); res_dir = os.path.join('results', slug); os.makedirs(res_dir, exist_ok=True)
+    reset_result_dir(res_dir)
+    started_at = datetime.now()
+    started_clock = time.time()
+    steps_log = []
+    console_tag = (urlparse(url).netloc or slug)[:28]
     classified_dir = os.path.join('results', '_classified')
     for cat in ['question', 'info', 'input', 'email', 'paywall', 'other', 'checkout']:
         os.makedirs(os.path.join(classified_dir, cat), exist_ok=True)
@@ -2639,6 +2824,11 @@ def run_funnel(
         "manifest_path": None,
         "stopped": False,
         "progress_message": "",
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "duration_sec": 0,
+        "steps": steps_log,
+        "prices": [],
+        "plans_screenshot": None,
     }
     max_steps = int(runner_cfg.get("max_steps", config.get("max_steps", 80)))
     slow_mo = int(runner_cfg.get("slow_mo_ms", config.get("slow_mo_ms", 100)))
@@ -2660,7 +2850,7 @@ def run_funnel(
             l = f"[{time.strftime('%H:%M:%S')}] {m}\n"
             f.write(l)
             f.flush()
-            print(l.strip())
+            print(f"{l.strip()[:10]} [{console_tag}] {l.strip()[11:]}", flush=True)
             log_lines.append(l.strip())
 
         def request_progress(current_step: int, total_steps: int, message: str = "", last_url: str = None):
@@ -2825,6 +3015,18 @@ def run_funnel(
                     screen_name = f"{step:02d}_{st}.png"
                     local_path = os.path.join(res_dir, screen_name)
                     result["last_screenshot"] = local_path
+                    step_record = {
+                        "n": step,
+                        "type": st,
+                        "ui_step": ui_before,
+                        "url": page.url,
+                        "screenshot": screen_name,
+                        "action": None,
+                        "at_sec": round(time.time() - started_clock, 1),
+                    }
+                    steps_log.append(step_record)
+                    if st in ['paywall', 'checkout']:
+                        result["prices"] = extract_prices(page)
                     try:
                         page.screenshot(path=local_path, full_page=True)
                         classified_path = os.path.join(classified_dir, st, f"{slug}__{screen_name}")
@@ -2836,6 +3038,7 @@ def run_funnel(
                             plans_path = os.path.join(res_dir, plans_name)
                             classified_plans_path = os.path.join(classified_dir, st, f"{slug}__{plans_name}")
                             if save_paywall_plans_screenshot(page, local_path, plans_path, log):
+                                result["plans_screenshot"] = plans_name
                                 try:
                                     shutil.copy2(plans_path, classified_plans_path)
                                     emit_artifact(plans_path)
@@ -2865,7 +3068,18 @@ def run_funnel(
                     if ui_a_num > ui_b_num + 1 and ui_b_num > 0:
                         log(f"Обнаружен пропуск шага UI: {ui_before} -> {ui_after}")
 
+                    curr_hash_after_action = get_screen_hash(page)
+                    if (
+                        st not in ['paywall', 'checkout']
+                        and not any(k in act for k in ["paywall", "checkout", "reached", "stopped"])
+                        and not has_meaningful_progress(curr_u, page.url, curr_h, curr_hash_after_action, ui_before, ui_after)
+                    ):
+                        if generic_advance(page, log, attempt=repeat_attempt):
+                            act = f"{act}+generic_advance"
+                            ui_after = get_ui_step(page)
+
                     log(f"Результат действия:{act}")
+                    step_record["action"] = act
 
                     curr_hash_after_action = get_screen_hash(page)
                     if ai_settings.get("enabled"):
@@ -2931,11 +3145,17 @@ def run_funnel(
             except:
                 pass
         finally:
+            result["duration_sec"] = round(time.time() - started_clock, 1)
             if write_manifest:
                 manifest = {
                     "url": url,
-                    "started_at": datetime.now().isoformat(),
-                    "completed_at": datetime.now().isoformat(),
+                    "slug": slug,
+                    "started_at": started_at.isoformat(timespec="seconds"),
+                    "completed_at": datetime.now().isoformat(timespec="seconds"),
+                    "duration_sec": result["duration_sec"],
+                    "steps": steps_log,
+                    "prices": result.get("prices") or [],
+                    "plans_screenshot": result.get("plans_screenshot"),
                     "status": "cancelled" if result["stopped"] else ("success" if result["paywall_reached"] else "completed"),
                     "steps_total": result["steps_total"],
                     "paywall_reached": result["paywall_reached"],

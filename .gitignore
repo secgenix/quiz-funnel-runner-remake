@@ -1,4 +1,5 @@
 ﻿venv/
+.venv/
 results/
 __pycache__/
 *.png
